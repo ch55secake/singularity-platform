@@ -21,6 +21,7 @@ USER singularity
 WORKDIR /data
 ENV SINGULARITY_BIND=0.0.0.0:8080
 ENV SINGULARITY_SPOOL_PATH=/data/salts.jsonl
+ENV SINGULARITY_CREDENTIALS_PATH=/data/collectors.json
 
 EXPOSE 8080
 ENTRYPOINT ["/usr/local/bin/singularity-platform"]

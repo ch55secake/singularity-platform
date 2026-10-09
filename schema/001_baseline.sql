@@ -11,6 +11,7 @@ CREATE TABLE IF NOT EXISTS singularity.match_salts
     metadata_salt Nullable(UInt32),
     replay_salt Nullable(UInt32),
     username Nullable(String),
+    collector_id Nullable(String),
     received_at DateTime DEFAULT now(),
     source String DEFAULT 'cache-collector'
 )

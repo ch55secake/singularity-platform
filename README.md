@@ -15,6 +15,22 @@ Run locally:
 SINGULARITY_INGEST_TOKEN=local-dev-token cargo run
 ```
 
+For multiple collectors, provision independent credentials instead of sharing
+one token:
+
+```bash
+SINGULARITY_CREDENTIALS_PATH=data/collectors.json \
+  cargo run -- credentials create oscar-desktop
+SINGULARITY_CREDENTIALS_PATH=data/collectors.json \
+  cargo run -- credentials list
+```
+
+The create and rotate commands print a token once. Store it in the collector's
+private configuration. Use `credentials rotate <id>` to invalidate the old
+token or `credentials revoke <id>` for emergency revocation. Restart the
+platform after changing the credential file; the file stores SHA-256 hashes,
+never plaintext tokens.
+
 Health check:
 
 ```bash
@@ -29,5 +45,9 @@ curl -X POST http://127.0.0.1:8080/ingest/salts \
   -H 'Content-Type: application/json' \
   -d '[{"match_id":42,"cluster_id":1,"metadata_salt":2}]'
 ```
+
+Accepted records include the authenticated collector identity in the JSONL
+spool. The legacy `SINGULARITY_INGEST_TOKEN` remains accepted during migration
+and is recorded as `legacy-global-token`.
 
 See [`SPEC.md`](SPEC.md) for the service contract.
