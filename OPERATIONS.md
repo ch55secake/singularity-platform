@@ -11,9 +11,14 @@
 
 ## Recovery
 
-The JSONL spool is append-only. Stop the platform before copying it, preserve
-the original file, and replay records through the ingestion endpoint after a
-restore.
+The JSONL spool is append-only and synchronized before an ingest request is
+acknowledged. On startup, the platform rebuilds its duplicate index from valid
+complete records. An incomplete final line is treated as a crash tail and can
+be left in place; earlier records remain recoverable.
+
+Stop the platform before copying the spool, preserve the original file, and
+replay records through the ingestion endpoint after a restore. Investigate
+malformed complete-line warnings before manually repairing a spool.
 
 ## Retention
 
