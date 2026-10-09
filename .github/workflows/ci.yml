@@ -18,7 +18,7 @@ env:
 
 jobs:
   actionlint:
-    name: Validate workflows
+    name: validate-workflows
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -27,7 +27,7 @@ jobs:
         uses: raven-actions/actionlint@v2
 
   format:
-    name: Format
+    name: format
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -42,7 +42,7 @@ jobs:
         run: cargo fmt --all -- --check
 
   clippy:
-    name: Clippy
+    name: clippy
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -70,7 +70,7 @@ jobs:
         run: cargo test --all-targets --locked
 
   build:
-    name: Build release
+    name: build-release
     runs-on: ubuntu-latest
     steps:
       - name: Checkout
@@ -83,7 +83,7 @@ jobs:
         run: cargo build --release --locked
 
   audit:
-    name: Dependency audit
+    name: dependency-audit
     runs-on: ubuntu-latest
     permissions:
       contents: read
