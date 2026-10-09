@@ -13,4 +13,6 @@ tables are:
 | `demo_player` | Demo-derived hero build and observed identity data |
 
 Salt values are credentials for Valve replay files and must not be exposed in
-logs or public API responses.
+logs or public API responses. Accepted salt records also retain the opaque
+collector identity assigned by the platform credential; bearer tokens are not
+stored with the record.
