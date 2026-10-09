@@ -42,9 +42,15 @@ baseline for forward compatibility.
 
 ## Baseline persistence
 
-Accepted records are appended to `SINGULARITY_SPOOL_PATH` as JSONL. Duplicate
-records are suppressed for the lifetime of the process. Persistent deduplication
-and ClickHouse ingestion are next-stage work.
+Accepted records are appended to `SINGULARITY_SPOOL_PATH` as JSONL. The file is
+flushed and synchronized before the request is acknowledged. On startup, the
+platform rebuilds its deduplication index from complete valid spool lines, so
+replaying a request after a restart is reported as a duplicate.
+
+An incomplete final line is treated as a crash tail and ignored; earlier valid
+records remain recoverable. Malformed complete lines are skipped and logged
+without logging their contents. Durable processing states, leases, retries,
+dead-letter records, and ClickHouse ingestion remain next-stage work.
 
 ## Processing stages
 
@@ -64,6 +70,7 @@ require a Steam account in any stage.
 - Valid cache submissions are accepted and persisted.
 - Invalid or empty batches are rejected.
 - Missing/incorrect bearer tokens are rejected when configured.
-- Duplicate submissions are safe.
+- Duplicate submissions are safe, including after a process restart.
+- A truncated final JSONL line does not prevent recovery of earlier records.
 - The process can restart without corrupting the spool.
 - Health remains available independently of the processing worker.
