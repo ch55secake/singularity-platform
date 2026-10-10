@@ -27,6 +27,28 @@ or a bearer token provisioned for one collector with the offline
 legacy token nor a credential record is configured; this development fallback
 must not be used in production.
 
+### Read API
+
+The platform exposes the browser-facing read contract at `/api/matches`,
+`/api/matches/{uuid}`, `/api/matches/{uuid}/positions`,
+`/api/matches/{uuid}/deaths`, and `/api/players/{account_id}`. Equivalent paths
+without the `/api` prefix are available for direct LAN clients. Reads use a
+separate optional `SINGULARITY_READ_TOKEN`; when it is unset, LAN-only network
+isolation is the authentication boundary. Read queries are issued only when a
+request arrives, so health and process startup do not require ClickHouse.
+
+Match IDs in browser links are UUIDs generated once by the parser and persisted
+in parser state. Numeric match IDs remain accepted for migration and direct
+operator use. The response hides Steam account IDs, resolves heroes and items
+through the asset snapshots, and maps configured account IDs to friend names
+from `SINGULARITY_MEMBER_NAMES_JSON`.
+
+The match detail response includes the final player-stat snapshot, every stats
+timeline row, source-normalized damage, item/ability events, death events,
+world-coordinate paths, and the current map asset. Missing optional metadata is
+represented by nulls or empty arrays. A healthy service returns `503` for read
+requests when ClickHouse is unavailable.
+
 The platform applies a fixed-window request limit independently to each
 collector and rejects request bodies larger than 512 KiB. The limits are
 configured with `SINGULARITY_COLLECTOR_RATE_LIMIT`,

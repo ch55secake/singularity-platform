@@ -4,6 +4,8 @@
   tokens with the offline credentials command; only SHA-256 token hashes are
   stored.
 - Keep ingestion reachable only through the private LAN or Tailscale.
+- Keep read endpoints reachable only through the private LAN or Tailscale; set
+  `SINGULARITY_READ_TOKEN` when network isolation alone is insufficient.
 - Never log salts, tokens, or Steam session data. Error responses contain only
   generic messages.
 - Keep `SINGULARITY_CREDENTIALS_PATH` private and mode `0600`; restart after
@@ -11,5 +13,7 @@
 - Do not add Steam login or Game Coordinator code to the platform.
 - Treat raw replay files as private temporary data.
 - Obtain consent before storing player-linked match data.
+- Keep `SINGULARITY_MEMBER_NAMES_JSON` private and use it only for consenting
+  friends; account IDs are never serialized into browser responses.
 - Provide deletion and retention controls before exposing the service beyond
   the friends group.

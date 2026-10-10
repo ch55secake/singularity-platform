@@ -6,7 +6,7 @@ tables are:
 | Table | Purpose |
 |---|---|
 | `match_salts` | Candidate cluster and metadata/replay salts |
-| `matches` | Parsed match-level metadata |
+| `matches` | Parsed match-level metadata and stable public UUID |
 | `match_players` | Parsed scoreboard rows and core player totals |
 | `match_player_items` | Item purchases, sales, imbued abilities, and ability-upgrade events |
 | `match_player_items_with_assets` | Item timeline rows classified through public asset lookups |

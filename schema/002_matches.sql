@@ -4,6 +4,7 @@
 CREATE TABLE IF NOT EXISTS singularity.matches
 (
     match_id UInt64,
+    public_id String,
     start_time Nullable(UInt32),
     duration_s Nullable(UInt32),
     winning_team Nullable(Int32),
@@ -15,6 +16,9 @@ CREATE TABLE IF NOT EXISTS singularity.matches
 )
 ENGINE = ReplacingMergeTree(metadata_version)
 ORDER BY match_id;
+
+-- Add the public browser id when upgrading a database created before the read API.
+ALTER TABLE singularity.matches ADD COLUMN IF NOT EXISTS public_id String AFTER match_id;
 
 CREATE TABLE IF NOT EXISTS singularity.match_players
 (
