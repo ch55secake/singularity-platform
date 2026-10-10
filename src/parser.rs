@@ -18,7 +18,7 @@ use tokio::{
 };
 use valveprotos::deadlock::CMsgMatchMetaDataContents;
 
-use valveprotos::deadlock::c_msg_match_meta_data_contents::{Items, Players};
+use valveprotos::deadlock::c_msg_match_meta_data_contents::{Items, Players, Position};
 
 const DEFAULT_OUTPUT_DIR: &str = "data/metadata";
 const DEFAULT_PARSE_STATE: &str = "data/metadata-parse-state.json";
@@ -138,6 +138,24 @@ struct DamageRow {
     metadata_version: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct DeathRow {
+    match_id: u64,
+    victim_slot: u32,
+    death_index: u32,
+    killer_slot: u32,
+    game_time_s: u32,
+    time_to_kill_s: Option<f32>,
+    victim_x: Option<f32>,
+    victim_y: Option<f32>,
+    victim_z: Option<f32>,
+    killer_x: Option<f32>,
+    killer_y: Option<f32>,
+    killer_z: Option<f32>,
+    death_duration_s: u32,
+    metadata_version: u64,
+}
+
 #[derive(Debug)]
 struct ParsedMatch {
     match_row: MatchRow,
@@ -145,6 +163,7 @@ struct ParsedMatch {
     stat_rows: Vec<PlayerStatRow>,
     item_rows: Vec<PlayerItemRow>,
     damage_rows: Vec<DamageRow>,
+    death_rows: Vec<DeathRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -218,6 +237,9 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         clickhouse
             .insert("match_damage", DAMAGE_COLUMNS, &parsed.damage_rows)
             .await?;
+        clickhouse
+            .insert("match_deaths", DEATH_COLUMNS, &parsed.death_rows)
+            .await?;
         state
             .processed
             .insert(job_id.to_string(), parsed.match_row.metadata_version);
@@ -235,6 +257,7 @@ const PLAYER_COLUMNS: &str = "match_id, account_id, player_slot, team, hero_id, 
 const STAT_COLUMNS: &str = "match_id, account_id, player_slot, snapshot_time_s, net_worth, gold_player, gold_player_orbs, gold_lane_creep_orbs, gold_neutral_creep_orbs, gold_boss, gold_boss_orb, gold_treasure, gold_denied, gold_death_loss, gold_lane_creep, gold_neutral_creep, kills, deaths, assists, creep_kills, neutral_kills, denies, player_damage, player_healing, self_healing, shots_hit, shots_missed, hero_bullets_hit, hero_bullets_hit_crit, bullet_kills, ability_kills, melee_kills, headshot_kills, player_damage_taken, damage_mitigated, damage_absorbed, self_damage, heal_prevented, heal_lost, teammate_healing, teammate_barriering, weapon_power, tech_power, max_health, level, metadata_version";
 const ITEM_COLUMNS: &str = "match_id, player_slot, game_time_s, item_id, upgrade_id, sold_time_s, flags, imbued_ability_id, upgrade_info, upgrade_unlocked, upgrade_tier, metadata_version";
 const DAMAGE_COLUMNS: &str = "match_id, dealer_slot, target_slot, source_details_index, stat_type, source_name, sample_time_s, raw_cumulative_damage, cumulative_damage, metadata_version";
+const DEATH_COLUMNS: &str = "match_id, victim_slot, death_index, killer_slot, game_time_s, time_to_kill_s, victim_x, victim_y, victim_z, killer_x, killer_y, killer_z, death_duration_s, metadata_version";
 
 impl ClickHouseClient {
     fn from_env() -> Result<Self, std::io::Error> {
@@ -406,6 +429,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
     let mut stat_rows = Vec::new();
     let mut item_rows = Vec::new();
     let damage_rows = damage_rows(match_id, info.damage_matrix.as_ref(), metadata_version);
+    let death_rows = death_rows(match_id, &info.players, metadata_version);
     for player in info.players {
         player_rows.push(player_row(match_id, &player, metadata_version));
         item_rows.extend(
@@ -427,6 +451,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
         stat_rows,
         item_rows,
         damage_rows,
+        death_rows,
     })
 }
 
@@ -587,6 +612,45 @@ fn damage_rows(
     rows
 }
 
+fn death_rows(match_id: u64, players: &[Players], metadata_version: u64) -> Vec<DeathRow> {
+    players
+        .iter()
+        .flat_map(|player| {
+            let victim_slot = player.player_slot.unwrap_or_default();
+            player
+                .death_details
+                .iter()
+                .enumerate()
+                .map(move |(death_index, death)| {
+                    let (victim_x, victim_y, victim_z) = position_fields(death.death_pos.as_ref());
+                    let (killer_x, killer_y, killer_z) = position_fields(death.killer_pos.as_ref());
+                    DeathRow {
+                        match_id,
+                        victim_slot,
+                        death_index: death_index as u32,
+                        killer_slot: death.killer_player_slot.unwrap_or_default(),
+                        game_time_s: death.game_time_s.unwrap_or_default(),
+                        time_to_kill_s: death.time_to_kill_s,
+                        victim_x,
+                        victim_y,
+                        victim_z,
+                        killer_x,
+                        killer_y,
+                        killer_z,
+                        death_duration_s: death.death_duration_s.unwrap_or_default(),
+                        metadata_version,
+                    }
+                })
+        })
+        .collect()
+}
+
+fn position_fields(position: Option<&Position>) -> (Option<f32>, Option<f32>, Option<f32>) {
+    position
+        .map(|position| (position.x, position.y, position.z))
+        .unwrap_or((None, None, None))
+}
+
 fn metadata_version(bytes: &[u8]) -> u64 {
     let digest = Sha256::digest(bytes);
     u64::from_le_bytes(digest[..8].try_into().expect("digest has eight bytes"))
@@ -595,7 +659,9 @@ fn metadata_version(bytes: &[u8]) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use valveprotos::deadlock::c_msg_match_meta_data_contents::{Items, MatchInfo, PlayerStats};
+    use valveprotos::deadlock::c_msg_match_meta_data_contents::{
+        Deaths, Items, MatchInfo, PlayerStats, Position,
+    };
     use valveprotos::deadlock::c_msg_match_player_damage_matrix::{
         DamageDealer, DamageSource, DamageToPlayer, SourceDetails,
     };
@@ -628,6 +694,22 @@ mod tests {
                     account_id: Some(7),
                     player_slot: Some(3),
                     hero_id: Some(10),
+                    death_details: vec![Deaths {
+                        game_time_s: Some(300),
+                        time_to_kill_s: Some(2.5),
+                        killer_player_slot: Some(4),
+                        death_pos: Some(Position {
+                            x: Some(10.0),
+                            y: Some(20.0),
+                            z: Some(30.0),
+                        }),
+                        killer_pos: Some(Position {
+                            x: Some(40.0),
+                            y: Some(50.0),
+                            z: Some(60.0),
+                        }),
+                        death_duration_s: Some(4),
+                    }],
                     items: vec![Items {
                         game_time_s: Some(95),
                         item_id: Some(1_841_661_392),
@@ -680,6 +762,11 @@ mod tests {
         assert_eq!(parsed.item_rows[0].item_id, 1_841_661_392);
         assert!(parsed.item_rows[0].upgrade_unlocked);
         assert_eq!(parsed.item_rows[0].upgrade_tier, 1);
+        assert_eq!(parsed.death_rows.len(), 1);
+        assert_eq!(parsed.death_rows[0].victim_slot, 3);
+        assert_eq!(parsed.death_rows[0].killer_slot, 4);
+        assert_eq!(parsed.death_rows[0].victim_x, Some(10.0));
+        assert_eq!(parsed.death_rows[0].killer_z, Some(60.0));
         assert_eq!(parsed.damage_rows.len(), 2);
         assert_eq!(parsed.damage_rows[1].source_name, "ability_test");
         assert_eq!(parsed.damage_rows[1].sample_time_s, 120);

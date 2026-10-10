@@ -13,6 +13,9 @@ tables are:
 | `match_damage` | Damage matrix samples by dealer, target, source, and time |
 | `match_damage_totals` | Final cumulative damage per source and target |
 | `match_damage_player_reconciliation` | Matrix damage compared with player timeline hero damage |
+| `match_deaths` | Death events with victim/killer positions and timing |
+| `match_deaths_with_players` | Death events joined to victim and killer hero/team data |
+| `match_death_count_reconciliation` | Recorded death counts compared with scoreboard deaths |
 | `match_player_stats` | Per-player timeline snapshots, including aim, combat, damage, and healing fields |
 | `match_players_with_derived` | Core KDR and KDA per player |
 | `match_player_stats_with_derived` | Accuracy, hero crit rate, kill shares, and damage taken per minute |

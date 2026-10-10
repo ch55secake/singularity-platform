@@ -96,6 +96,12 @@ the wire value while `cumulative_damage` divides it by two. The totals view
 uses the latest sample, and the reconciliation view filters to known player
 targets before comparing against the final `player_damage` stat snapshot.
 
+The parser expands each `players[].death_details[]` event into `match_deaths`,
+preserving game time, time-to-kill, victim and killer positions, and death
+duration. `match_deaths_with_players` joins both slots to scoreboard hero/team
+data. `match_death_count_reconciliation` compares recorded victim counts with
+the parsed scoreboard `deaths` totals.
+
 The `assets-sync` command snapshots the public heroes, items, modifiers, and
 map assets into the `schema/003_assets.sql` lookup tables. Snapshot hashes make
 repeated refreshes idempotent, and the map snapshot records the minimap URL and
