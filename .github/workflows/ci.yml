@@ -32,8 +32,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -49,8 +47,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -66,8 +62,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
@@ -81,8 +75,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v4
-      - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies

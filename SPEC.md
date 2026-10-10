@@ -69,12 +69,6 @@ private state file tracks `metadata_pending` and `metadata_processed`, retry
 attempts, next retry time, and bounded error codes. The worker does not require
 Steam credentials.
 
-The `metadata-parser` command decodes the protobuf handoff with the pinned
-Deadlock `valveprotos` definitions and inserts match, player, and timeline rows
-into ClickHouse using JSONEachRow. It tracks processed job digests separately
-and uses the `schema/002_matches.sql` ReplacingMergeTree tables for idempotent
-re-parsing.
-
 ## Processing stages
 
 Planned states:
