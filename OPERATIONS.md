@@ -76,13 +76,18 @@ SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
   singularity-platform metadata-parser
 ```
 
-The parser writes match, player, and player-timeline rows as JSONEachRow and
+The parser writes match, player, item-timeline, and player-stat rows as JSONEachRow and
 records processed job digests in `SINGULARITY_METADATA_PARSE_STATE_PATH`.
 Timeline rows include the aim, kill-type, damage, mitigation, healing, power,
 and health counters used by the derived views. `player_stat_averages` selects
 the last snapshot for each player in each match before averaging across
 matches. ReplacingMergeTree tables and the parser state make repeated parsing
 idempotent.
+
+Apply `schema/003_assets.sql` after `schema/002_matches.sql` so
+`match_player_items_with_assets` can resolve timeline IDs from the hero/item
+snapshots. The view uses the asset payload's `type` field to distinguish
+ability upgrades from shop upgrades.
 
 ## Asset lookups
 
