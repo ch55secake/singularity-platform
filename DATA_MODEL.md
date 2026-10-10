@@ -6,6 +6,9 @@ tables are:
 | Table | Purpose |
 |---|---|
 | `match_salts` | Candidate cluster and metadata/replay salts |
+| `matches` | Parsed match-level metadata |
+| `match_players` | Parsed scoreboard rows and core player totals |
+| `match_player_stats` | Per-player timeline snapshots |
 | `match_jobs` | Download and parse state machine |
 | `match_metadata` | Match-level protobuf fields |
 | `match_player` | Detailed player and match statistics |
