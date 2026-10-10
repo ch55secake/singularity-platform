@@ -11,6 +11,13 @@
 | `SINGULARITY_COLLECTOR_MAX_BATCH_SIZE` | `1000` | Maximum records per collector request |
 | `SINGULARITY_COLLECTOR_RATE_LIMIT` | `60` | Requests per collector window |
 | `SINGULARITY_COLLECTOR_RATE_WINDOW_SECONDS` | `60` | Rate-limit window |
+| `SINGULARITY_METADATA_SPOOL_PATH` | `SINGULARITY_SPOOL_PATH` | Worker spool override |
+| `SINGULARITY_METADATA_STATE_PATH` | `data/metadata-state.json` | Metadata job state |
+| `SINGULARITY_METADATA_OUTPUT_DIR` | `data/metadata` | Decompressed metadata handoff files |
+| `SINGULARITY_METADATA_BASE_URL` | `http://replay{cluster}.valve.net/1422450` | Metadata URL base |
+| `SINGULARITY_METADATA_TIMEOUT_SECONDS` | `30` | Per-download timeout |
+| `SINGULARITY_METADATA_RETRY_BASE_SECONDS` | `30` | Initial retry delay |
+| `SINGULARITY_METADATA_RETRY_MAX_SECONDS` | `3600` | Maximum retry delay |
 | `RUST_LOG` | `singularity_platform=info` | Logging filter |
 
 ## Collector credentials
@@ -34,6 +41,24 @@ Credential changes are written atomically, but the running platform reads the
 file at startup; restart the service after creating, rotating, or revoking a
 credential. The legacy `SINGULARITY_INGEST_TOKEN` remains available during
 migration and is attributed as `legacy-global-token`.
+
+## Metadata worker
+
+Run one restart-safe metadata pass after ingestion, from a cron or deployment
+worker:
+
+```bash
+singularity-platform metadata-worker
+```
+
+The worker reads `SINGULARITY_METADATA_SPOOL_PATH` or
+`SINGULARITY_SPOOL_PATH`, downloads each eligible metadata file, accepts the
+known zstd payload despite its `.bz2` suffix, and falls back to bzip2 when the
+magic bytes indicate bzip2. Decompressed handoff files are written atomically
+under `SINGULARITY_METADATA_OUTPUT_DIR`. The state file records
+`metadata_pending`/`metadata_processed`, attempts, retry time, and a bounded
+error code without storing the URL or salt. Failed downloads use exponential
+backoff, including 404 and 5xx responses.
 
 ## Recovery
 
