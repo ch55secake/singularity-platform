@@ -85,6 +85,25 @@ struct PlayerStatRow {
     player_damage: Option<u32>,
     player_healing: Option<u32>,
     self_healing: Option<u32>,
+    shots_hit: Option<u32>,
+    shots_missed: Option<u32>,
+    hero_bullets_hit: Option<u32>,
+    hero_bullets_hit_crit: Option<u32>,
+    bullet_kills: Option<u32>,
+    ability_kills: Option<u32>,
+    melee_kills: Option<u32>,
+    headshot_kills: Option<u32>,
+    player_damage_taken: Option<u32>,
+    damage_mitigated: Option<u32>,
+    damage_absorbed: Option<u32>,
+    self_damage: Option<u32>,
+    heal_prevented: Option<u32>,
+    heal_lost: Option<u32>,
+    teammate_healing: Option<u32>,
+    teammate_barriering: Option<u32>,
+    weapon_power: Option<u32>,
+    tech_power: Option<u32>,
+    max_health: Option<u32>,
     level: Option<u32>,
     metadata_version: u64,
 }
@@ -175,7 +194,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
 
 const MATCH_COLUMNS: &str = "match_id, start_time, duration_s, winning_team, game_mode, match_mode, average_badge_team0, average_badge_team1, metadata_version";
 const PLAYER_COLUMNS: &str = "match_id, account_id, player_slot, team, hero_id, kills, deaths, assists, net_worth, last_hits, denies, level, assigned_lane, abandon_match_time_s, mvp_rank, metadata_version";
-const STAT_COLUMNS: &str = "match_id, account_id, player_slot, snapshot_time_s, net_worth, gold_player, gold_player_orbs, gold_lane_creep_orbs, gold_neutral_creep_orbs, gold_boss, gold_boss_orb, gold_treasure, gold_denied, gold_death_loss, gold_lane_creep, gold_neutral_creep, kills, deaths, assists, creep_kills, neutral_kills, denies, player_damage, player_healing, self_healing, level, metadata_version";
+const STAT_COLUMNS: &str = "match_id, account_id, player_slot, snapshot_time_s, net_worth, gold_player, gold_player_orbs, gold_lane_creep_orbs, gold_neutral_creep_orbs, gold_boss, gold_boss_orb, gold_treasure, gold_denied, gold_death_loss, gold_lane_creep, gold_neutral_creep, kills, deaths, assists, creep_kills, neutral_kills, denies, player_damage, player_healing, self_healing, shots_hit, shots_missed, hero_bullets_hit, hero_bullets_hit_crit, bullet_kills, ability_kills, melee_kills, headshot_kills, player_damage_taken, damage_mitigated, damage_absorbed, self_damage, heal_prevented, heal_lost, teammate_healing, teammate_barriering, weapon_power, tech_power, max_health, level, metadata_version";
 
 impl ClickHouseClient {
     fn from_env() -> Result<Self, std::io::Error> {
@@ -414,6 +433,25 @@ fn player_stat_row(
         player_damage: stats.player_damage,
         player_healing: stats.player_healing,
         self_healing: stats.self_healing,
+        shots_hit: stats.shots_hit,
+        shots_missed: stats.shots_missed,
+        hero_bullets_hit: stats.hero_bullets_hit,
+        hero_bullets_hit_crit: stats.hero_bullets_hit_crit,
+        bullet_kills: stats.bullet_kills,
+        ability_kills: stats.ability_kills,
+        melee_kills: stats.melee_kills,
+        headshot_kills: stats.headshot_kills,
+        player_damage_taken: stats.player_damage_taken,
+        damage_mitigated: stats.damage_mitigated,
+        damage_absorbed: stats.damage_absorbed,
+        self_damage: stats.self_damage,
+        heal_prevented: stats.heal_prevented,
+        heal_lost: stats.heal_lost,
+        teammate_healing: stats.teammate_healing,
+        teammate_barriering: stats.teammate_barriering,
+        weapon_power: stats.weapon_power,
+        tech_power: stats.tech_power,
+        max_health: stats.max_health,
         level: stats.level,
         metadata_version,
     }
@@ -447,6 +485,25 @@ mod tests {
                         time_stamp_s: Some(180),
                         net_worth: Some(4_200),
                         player_damage: Some(9_000),
+                        shots_hit: Some(1_701),
+                        shots_missed: Some(1_503),
+                        hero_bullets_hit: Some(425),
+                        hero_bullets_hit_crit: Some(49),
+                        bullet_kills: Some(5),
+                        ability_kills: Some(2),
+                        melee_kills: Some(1),
+                        headshot_kills: Some(3),
+                        player_damage_taken: Some(7_500),
+                        damage_mitigated: Some(1_200),
+                        damage_absorbed: Some(350),
+                        self_damage: Some(25),
+                        heal_prevented: Some(100),
+                        heal_lost: Some(50),
+                        teammate_healing: Some(400),
+                        teammate_barriering: Some(200),
+                        weapon_power: Some(12),
+                        tech_power: Some(8),
+                        max_health: Some(850),
                         level: Some(6),
                         ..Default::default()
                     }],
@@ -464,6 +521,10 @@ mod tests {
         assert_eq!(parsed.player_rows[0].kills, Some(8));
         assert_eq!(parsed.stat_rows[0].snapshot_time_s, 180);
         assert_eq!(parsed.stat_rows[0].player_damage, Some(9_000));
+        assert_eq!(parsed.stat_rows[0].shots_hit, Some(1_701));
+        assert_eq!(parsed.stat_rows[0].hero_bullets_hit_crit, Some(49));
+        assert_eq!(parsed.stat_rows[0].headshot_kills, Some(3));
+        assert_eq!(parsed.stat_rows[0].player_damage_taken, Some(7_500));
         assert_eq!(parsed.match_row.metadata_version, metadata_version(&bytes));
     }
 
