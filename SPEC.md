@@ -63,6 +63,12 @@ records remain recoverable. Malformed complete lines are skipped and logged
 without logging their contents. Durable processing states, leases, retries,
 dead-letter records, and ClickHouse ingestion remain next-stage work.
 
+The one-shot `metadata-worker` reads eligible records from the spool and writes
+decompressed metadata handoff files to `SINGULARITY_METADATA_OUTPUT_DIR`. Its
+private state file tracks `metadata_pending` and `metadata_processed`, retry
+attempts, next retry time, and bounded error codes. The worker does not require
+Steam credentials.
+
 ## Processing stages
 
 Planned states:

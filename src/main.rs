@@ -1,6 +1,8 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
+mod metadata;
+
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
     env,
@@ -106,6 +108,11 @@ enum CredentialCommand {
     List,
 }
 
+enum Command {
+    Credentials(CredentialCommand),
+    MetadataWorker,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct SaltKey {
     match_id: u64,
@@ -141,7 +148,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let command = parse_command(env::args().skip(1))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if let Some(command) = command {
-        return run_credential_command(command).await;
+        return match command {
+            Command::Credentials(command) => run_credential_command(command).await,
+            Command::MetadataWorker => metadata::run().await,
+        };
     }
 
     tracing_subscriber::fmt()
@@ -500,12 +510,16 @@ async fn run_credential_command(
     Ok(())
 }
 
-fn parse_command(
-    mut args: impl Iterator<Item = String>,
-) -> Result<Option<CredentialCommand>, String> {
+fn parse_command(mut args: impl Iterator<Item = String>) -> Result<Option<Command>, String> {
     let Some(command) = args.next() else {
         return Ok(None);
     };
+    if command == "metadata-worker" {
+        if args.next().is_some() {
+            return Err("unexpected metadata worker argument".to_string());
+        }
+        return Ok(Some(Command::MetadataWorker));
+    }
     if command != "credentials" && command != "credential" {
         return Err("unknown command".to_string());
     }
@@ -522,7 +536,7 @@ fn parse_command(
     if args.next().is_some() {
         return Err("unexpected credential command argument".to_string());
     }
-    Ok(Some(parsed))
+    Ok(Some(Command::Credentials(parsed)))
 }
 
 fn parse_collector_id(args: &mut impl Iterator<Item = String>) -> Result<String, String> {

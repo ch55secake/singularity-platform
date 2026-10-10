@@ -15,4 +15,6 @@ tables are:
 Salt values are credentials for Valve replay files and must not be exposed in
 logs or public API responses. Accepted salt records also retain the opaque
 collector identity assigned by the platform credential; bearer tokens are not
-stored with the record.
+stored with the record. The metadata worker writes decompressed protobuf
+handoff files keyed by a non-reversible job digest; the later parser owns
+deletion after successful parsing.

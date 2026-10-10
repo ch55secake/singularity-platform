@@ -50,4 +50,13 @@ Accepted records include the authenticated collector identity in the JSONL
 spool. The legacy `SINGULARITY_INGEST_TOKEN` remains accepted during migration
 and is recorded as `legacy-global-token`.
 
+Run one metadata download pass with:
+
+```bash
+singularity-platform metadata-worker
+```
+
+It writes decompressed metadata handoff files and restart-safe job state under
+`data/` by default. No Steam login or Steam credentials are used.
+
 See [`SPEC.md`](SPEC.md) for the service contract.
