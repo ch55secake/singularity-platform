@@ -38,6 +38,24 @@ CREATE TABLE IF NOT EXISTS singularity.match_players
 ENGINE = ReplacingMergeTree(metadata_version)
 ORDER BY (match_id, player_slot, account_id);
 
+CREATE TABLE IF NOT EXISTS singularity.match_player_items
+(
+    match_id UInt64,
+    player_slot UInt32,
+    game_time_s UInt32,
+    item_id UInt32,
+    upgrade_id UInt32,
+    sold_time_s UInt32,
+    flags UInt32,
+    imbued_ability_id UInt32,
+    upgrade_info UInt32,
+    upgrade_unlocked Bool,
+    upgrade_tier UInt32,
+    metadata_version UInt64
+)
+ENGINE = ReplacingMergeTree(metadata_version)
+ORDER BY (match_id, player_slot, game_time_s, item_id, upgrade_id, upgrade_info);
+
 CREATE TABLE IF NOT EXISTS singularity.match_player_stats
 (
     match_id UInt64,
