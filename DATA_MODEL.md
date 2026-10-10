@@ -8,6 +8,8 @@ tables are:
 | `match_salts` | Candidate cluster and metadata/replay salts |
 | `matches` | Parsed match-level metadata |
 | `match_players` | Parsed scoreboard rows and core player totals |
+| `match_player_items` | Item purchases, sales, imbued abilities, and ability-upgrade events |
+| `match_player_items_with_assets` | Item timeline rows classified through public asset lookups |
 | `match_player_stats` | Per-player timeline snapshots, including aim, combat, damage, and healing fields |
 | `match_players_with_derived` | Core KDR and KDA per player |
 | `match_player_stats_with_derived` | Accuracy, hero crit rate, kill shares, and damage taken per minute |

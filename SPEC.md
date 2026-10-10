@@ -80,6 +80,14 @@ headshot kill share, and damage taken per minute. Per-account averages use the
 last snapshot in each match; `headshot_kills` is a subset of `bullet_kills` and
 is therefore not included in the kill-share denominator.
 
+The parser also writes every `players[].items[]` event to
+`match_player_items`, including shop purchases, sales, imbued abilities, and
+ability upgrades. `upgrade_info` preserves the packed source value and adds
+the upstream unlock-bit and upgrade-star count decoding. The
+`match_player_items_with_assets` view joins `item_id` to the public asset
+snapshots: `type = ability` identifies ability upgrades and `type = upgrade`
+identifies shop upgrades.
+
 The `assets-sync` command snapshots the public heroes, items, modifiers, and
 map assets into the `schema/003_assets.sql` lookup tables. Snapshot hashes make
 repeated refreshes idempotent, and the map snapshot records the minimap URL and
