@@ -9,6 +9,10 @@ tables are:
 | `matches` | Parsed match-level metadata |
 | `match_players` | Parsed scoreboard rows and core player totals |
 | `match_player_stats` | Per-player timeline snapshots |
+| `heroes` | Versioned hero names and images |
+| `items` | Versioned item names and images |
+| `abilities` | Versioned ability and modifier names |
+| `map_assets` | Minimap URL and world bounds |
 | `match_jobs` | Download and parse state machine |
 | `match_metadata` | Match-level protobuf fields |
 | `match_player` | Detailed player and match statistics |
