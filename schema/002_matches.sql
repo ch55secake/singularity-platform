@@ -99,6 +99,22 @@ CREATE TABLE IF NOT EXISTS singularity.match_deaths
 ENGINE = ReplacingMergeTree(metadata_version)
 ORDER BY (match_id, victim_slot, game_time_s, death_index);
 
+CREATE TABLE IF NOT EXISTS singularity.match_player_positions
+(
+    match_id UInt64,
+    player_slot UInt32,
+    sample_index UInt32,
+    time_s Float32,
+    x Nullable(Float32),
+    y Nullable(Float32),
+    health Nullable(UInt32),
+    combat_type Nullable(Int32),
+    move_type Nullable(Int32),
+    metadata_version UInt64
+)
+ENGINE = ReplacingMergeTree(metadata_version)
+ORDER BY (match_id, player_slot, sample_index);
+
 CREATE TABLE IF NOT EXISTS singularity.match_player_stats
 (
     match_id UInt64,

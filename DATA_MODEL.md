@@ -16,6 +16,7 @@ tables are:
 | `match_deaths` | Death events with victim/killer positions and timing |
 | `match_deaths_with_players` | Death events joined to victim and killer hero/team data |
 | `match_death_count_reconciliation` | Recorded death counts compared with scoreboard deaths |
+| `match_player_positions` | Quantized player paths converted to world coordinates |
 | `match_player_stats` | Per-player timeline snapshots, including aim, combat, damage, and healing fields |
 | `match_players_with_derived` | Core KDR and KDA per player |
 | `match_player_stats_with_derived` | Accuracy, hero crit rate, kill shares, and damage taken per minute |
