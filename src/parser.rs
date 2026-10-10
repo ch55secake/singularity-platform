@@ -8,6 +8,7 @@ use std::{
 #[cfg(unix)]
 use std::os::unix::fs::PermissionsExt;
 
+use getrandom::fill as fill_random;
 use prost::Message;
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
@@ -28,6 +29,7 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct MatchRow {
     match_id: u64,
+    public_id: String,
     start_time: Option<u32>,
     duration_s: Option<u32>,
     winning_team: Option<i32>,
@@ -186,11 +188,14 @@ struct ParseStateFile {
     version: u32,
     #[serde(default)]
     processed: BTreeMap<String, u64>,
+    #[serde(default)]
+    public_ids: BTreeMap<u64, String>,
 }
 
 struct ParseState {
     path: PathBuf,
     processed: BTreeMap<String, u64>,
+    public_ids: BTreeMap<u64, String>,
 }
 
 struct ClickHouseConfig {
@@ -232,7 +237,17 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let bytes = fs::read(&path).await?;
-        let parsed = parse_metadata(&bytes)?;
+        let mut parsed = parse_metadata(&bytes)?;
+        let public_id = match state.public_ids.entry(parsed.match_row.match_id) {
+            std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
+            std::collections::btree_map::Entry::Vacant(entry) => {
+                let public_id = generate_public_id()?;
+                entry.insert(public_id.clone());
+                public_id
+            }
+        };
+        parsed.match_row.public_id = public_id;
+        state.save().await?;
         clickhouse
             .insert(
                 "matches",
@@ -274,7 +289,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-const MATCH_COLUMNS: &str = "match_id, start_time, duration_s, winning_team, game_mode, match_mode, average_badge_team0, average_badge_team1, metadata_version";
+const MATCH_COLUMNS: &str = "match_id, public_id, start_time, duration_s, winning_team, game_mode, match_mode, average_badge_team0, average_badge_team1, metadata_version";
 const PLAYER_COLUMNS: &str = "match_id, account_id, player_slot, team, hero_id, kills, deaths, assists, net_worth, last_hits, denies, level, assigned_lane, abandon_match_time_s, mvp_rank, metadata_version";
 const STAT_COLUMNS: &str = "match_id, account_id, player_slot, snapshot_time_s, net_worth, gold_player, gold_player_orbs, gold_lane_creep_orbs, gold_neutral_creep_orbs, gold_boss, gold_boss_orb, gold_treasure, gold_denied, gold_death_loss, gold_lane_creep, gold_neutral_creep, kills, deaths, assists, creep_kills, neutral_kills, denies, player_damage, player_healing, self_healing, shots_hit, shots_missed, hero_bullets_hit, hero_bullets_hit_crit, bullet_kills, ability_kills, melee_kills, headshot_kills, player_damage_taken, damage_mitigated, damage_absorbed, self_damage, heal_prevented, heal_lost, teammate_healing, teammate_barriering, weapon_power, tech_power, max_health, level, metadata_version";
 const ITEM_COLUMNS: &str = "match_id, player_slot, game_time_s, item_id, upgrade_id, sold_time_s, flags, imbued_ability_id, upgrade_info, upgrade_unlocked, upgrade_tier, metadata_version";
@@ -368,6 +383,7 @@ impl ParseState {
             return Ok(Self {
                 path: path.to_path_buf(),
                 processed: BTreeMap::new(),
+                public_ids: BTreeMap::new(),
             });
         }
         #[cfg(unix)]
@@ -383,6 +399,7 @@ impl ParseState {
         Ok(Self {
             path: path.to_path_buf(),
             processed: file.processed,
+            public_ids: file.public_ids,
         })
     }
 
@@ -397,6 +414,7 @@ impl ParseState {
         let contents = serde_json::to_vec_pretty(&ParseStateFile {
             version: 1,
             processed: self.processed.clone(),
+            public_ids: self.public_ids.clone(),
         })?;
         let temp_path = self.path.with_file_name(format!(
             ".{}.tmp-{}",
@@ -439,6 +457,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
     let metadata_version = metadata_version(bytes);
     let match_row = MatchRow {
         match_id,
+        public_id: String::new(),
         start_time: info.start_time,
         duration_s: info.duration_s,
         winning_team: info.winning_team,
@@ -745,6 +764,21 @@ fn world_coordinate(
 fn metadata_version(bytes: &[u8]) -> u64 {
     let digest = Sha256::digest(bytes);
     u64::from_le_bytes(digest[..8].try_into().expect("digest has eight bytes"))
+}
+
+fn generate_public_id() -> Result<String, std::io::Error> {
+    let mut bytes = [0_u8; 16];
+    fill_random(&mut bytes).map_err(std::io::Error::other)?;
+    bytes[6] = (bytes[6] & 0x0f) | 0x40;
+    bytes[8] = (bytes[8] & 0x3f) | 0x80;
+    Ok(format!(
+        "{}-{}-{}-{}-{}",
+        hex::encode(&bytes[0..4]),
+        hex::encode(&bytes[4..6]),
+        hex::encode(&bytes[6..8]),
+        hex::encode(&bytes[8..10]),
+        hex::encode(&bytes[10..16]),
+    ))
 }
 
 #[cfg(test)]

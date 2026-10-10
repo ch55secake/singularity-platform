@@ -73,4 +73,15 @@ SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
   singularity-platform assets-sync
 ```
 
+The read API is available after applying the match and asset schemas:
+
+```bash
+curl http://127.0.0.1:8080/api/matches
+curl http://127.0.0.1:8080/api/matches/<uuid>
+```
+
+Set `SINGULARITY_READ_TOKEN` to protect reads with a separate bearer token.
+Use `SINGULARITY_MEMBER_NAMES_JSON` to resolve consenting friends' account IDs
+to display names; account IDs are never returned by the browser API.
+
 See [`SPEC.md`](SPEC.md) for the service contract.

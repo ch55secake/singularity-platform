@@ -23,6 +23,9 @@
 | `SINGULARITY_CLICKHOUSE_DATABASE` | `singularity` | ClickHouse database |
 | `SINGULARITY_CLICKHOUSE_USER` | unset | ClickHouse user |
 | `SINGULARITY_CLICKHOUSE_PASSWORD` | unset | ClickHouse password |
+| `SINGULARITY_READ_TOKEN` | unset | Optional bearer token for read endpoints |
+| `SINGULARITY_READ_TIMEOUT_SECONDS` | `10` | Read-side ClickHouse timeout |
+| `SINGULARITY_MEMBER_NAMES_JSON` | unset | Optional JSON object mapping account IDs to friend names |
 | `SINGULARITY_ASSETS_BASE_URL` | `https://api.deadlock-api.com/v1/assets` | Public asset API base |
 | `SINGULARITY_ASSETS_STATE_PATH` | `data/assets-state.json` | Asset snapshot state |
 | `SINGULARITY_ASSETS_TIMEOUT_SECONDS` | `30` | Asset request timeout |
@@ -106,6 +109,36 @@ Apply `schema/003_assets.sql` after `schema/002_matches.sql` so
 `match_player_items_with_assets` can resolve timeline IDs from the hero/item
 snapshots. The view uses the asset payload's `type` field to distinguish
 ability upgrades from shop upgrades.
+
+## Read API
+
+The platform serves the browser contract at both `/matches` and `/api/matches`
+(and the corresponding player, positions, and deaths paths). The `/api/`
+aliases are used by the web application's same-origin reverse proxy:
+
+```text
+GET /api/matches
+GET /api/matches/{uuid}
+GET /api/matches/{uuid}/positions
+GET /api/matches/{uuid}/deaths
+GET /api/players/{account_id}
+```
+
+Read access is LAN-only by deployment policy and has no authentication by
+default. Set `SINGULARITY_READ_TOKEN` to require a separate `Authorization:
+Bearer ...` token without affecting collector credentials. The API returns
+`503` when ClickHouse is unavailable; `/health` remains independent of it.
+
+Friend names are resolved from the optional startup configuration, for example:
+
+```bash
+SINGULARITY_MEMBER_NAMES_JSON='{"12345678":"oscar"}' \
+  singularity-platform
+```
+
+Steam account IDs are used only for this server-side lookup and are not
+included in browser JSON responses. Hero, item, ability, and map names and
+images come from the versioned asset tables.
 
 ## Asset lookups
 

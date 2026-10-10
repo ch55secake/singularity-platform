@@ -4,6 +4,7 @@
 mod assets;
 mod metadata;
 mod parser;
+mod read_api;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -56,6 +57,7 @@ struct AppState {
     rate_limit: RateLimit,
     max_batch_size: usize,
     authentication_required: bool,
+    read_api: read_api::ReadApiState,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -195,6 +197,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
     let max_batch_size = configured_batch_size()?;
     let rate_limit = configured_rate_limit()?;
+    let read_api = read_api::ReadApiState::from_env()?;
 
     let state = AppState {
         legacy_token,
@@ -205,10 +208,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         rate_limit,
         max_batch_size,
         authentication_required,
+        read_api,
     };
     let app = Router::new()
         .route("/health", get(health))
         .route("/ingest/salts", post(ingest_salts))
+        .route("/matches", get(read_api::list_matches))
+        .route("/matches/{identifier}", get(read_api::get_match))
+        .route(
+            "/matches/{identifier}/positions",
+            get(read_api::get_positions),
+        )
+        .route("/matches/{identifier}/deaths", get(read_api::get_deaths))
+        .route("/api/matches", get(read_api::list_matches))
+        .route("/api/matches/{identifier}", get(read_api::get_match))
+        .route(
+            "/api/matches/{identifier}/positions",
+            get(read_api::get_positions),
+        )
+        .route(
+            "/api/matches/{identifier}/deaths",
+            get(read_api::get_deaths),
+        )
+        .route("/players/{account_id}", get(read_api::get_player))
+        .route("/api/players/{account_id}", get(read_api::get_player))
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
 
@@ -863,6 +886,7 @@ mod tests {
             },
             max_batch_size: MAX_BATCH_SIZE,
             authentication_required: true,
+            read_api: read_api::ReadApiState::from_env().expect("read API state initializes"),
         };
         let mut headers = HeaderMap::new();
         headers.insert(
