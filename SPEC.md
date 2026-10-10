@@ -88,6 +88,14 @@ the upstream unlock-bit and upgrade-star count decoding. The
 snapshots: `type = ability` identifies ability upgrades and `type = upgrade`
 identifies shop upgrades.
 
+The parser expands `match_info.damage_matrix` into `match_damage`. Its aligned
+`source_details.stat_type` and `source_details.source_name` arrays resolve each
+`source_details_index`; stat type `0` is player damage. The protobuf matrix
+stores damage in doubled fixed-point units, so `raw_cumulative_damage` retains
+the wire value while `cumulative_damage` divides it by two. The totals view
+uses the latest sample, and the reconciliation view filters to known player
+targets before comparing against the final `player_damage` stat snapshot.
+
 The `assets-sync` command snapshots the public heroes, items, modifiers, and
 map assets into the `schema/003_assets.sql` lookup tables. Snapshot hashes make
 repeated refreshes idempotent, and the map snapshot records the minimap URL and
