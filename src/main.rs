@@ -1,6 +1,7 @@
 #![forbid(unsafe_code)]
 #![deny(clippy::all)]
 
+mod assets;
 mod metadata;
 mod parser;
 
@@ -113,6 +114,7 @@ enum Command {
     Credentials(CredentialCommand),
     MetadataWorker,
     MetadataParser,
+    AssetsSync,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -154,6 +156,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Command::Credentials(command) => run_credential_command(command).await,
             Command::MetadataWorker => metadata::run().await,
             Command::MetadataParser => parser::run().await,
+            Command::AssetsSync => assets::run().await,
         };
     }
 
@@ -528,6 +531,12 @@ fn parse_command(mut args: impl Iterator<Item = String>) -> Result<Option<Comman
             return Err("unexpected metadata parser argument".to_string());
         }
         return Ok(Some(Command::MetadataParser));
+    }
+    if command == "assets-sync" {
+        if args.next().is_some() {
+            return Err("unexpected assets sync argument".to_string());
+        }
+        return Ok(Some(Command::AssetsSync));
     }
     if command != "credentials" && command != "credential" {
         return Err("unknown command".to_string());

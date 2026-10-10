@@ -75,6 +75,11 @@ into ClickHouse using JSONEachRow. It tracks processed job digests separately
 and uses the `schema/002_matches.sql` ReplacingMergeTree tables for idempotent
 re-parsing.
 
+The `assets-sync` command snapshots the public heroes, items, modifiers, and
+map assets into the `schema/003_assets.sql` lookup tables. Snapshot hashes make
+repeated refreshes idempotent, and the map snapshot records the minimap URL and
+world bounds needed by position and death consumers.
+
 ## Processing stages
 
 Planned states:

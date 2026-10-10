@@ -66,4 +66,11 @@ SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
   singularity-platform metadata-parser
 ```
 
+Refresh public name and image lookups with:
+
+```bash
+SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  singularity-platform assets-sync
+```
+
 See [`SPEC.md`](SPEC.md) for the service contract.

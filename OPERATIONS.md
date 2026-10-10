@@ -23,6 +23,9 @@
 | `SINGULARITY_CLICKHOUSE_DATABASE` | `singularity` | ClickHouse database |
 | `SINGULARITY_CLICKHOUSE_USER` | unset | ClickHouse user |
 | `SINGULARITY_CLICKHOUSE_PASSWORD` | unset | ClickHouse password |
+| `SINGULARITY_ASSETS_BASE_URL` | `https://api.deadlock-api.com/v1/assets` | Public asset API base |
+| `SINGULARITY_ASSETS_STATE_PATH` | `data/assets-state.json` | Asset snapshot state |
+| `SINGULARITY_ASSETS_TIMEOUT_SECONDS` | `30` | Asset request timeout |
 | `RUST_LOG` | `singularity_platform=info` | Logging filter |
 
 ## Collector credentials
@@ -77,6 +80,21 @@ The parser writes match, player, and player-timeline rows as JSONEachRow and
 records processed job digests in `SINGULARITY_METADATA_PARSE_STATE_PATH`.
 ReplacingMergeTree tables and the derived view make repeated parsing
 idempotent.
+
+## Asset lookups
+
+Apply `schema/003_assets.sql`, then refresh the public hero, item, ability, and
+map snapshots with:
+
+```bash
+SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  singularity-platform assets-sync
+```
+
+The command classifies ability assets from the public items response, stores
+the raw public payload for forward compatibility, and skips ClickHouse writes
+when the endpoint snapshots have not changed. The map row includes the
+minimap URL and `[-radius, radius]` world bounds for position conversion.
 
 ## Recovery
 
