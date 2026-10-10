@@ -84,6 +84,11 @@ the last snapshot for each player in each match before averaging across
 matches. ReplacingMergeTree tables and the parser state make repeated parsing
 idempotent.
 
+Damage matrix samples are written to `match_damage`; query
+`match_damage_player_reconciliation` to compare the normalized stat-type-0
+totals against each player's final `player_damage` value. The raw matrix value
+is retained because the protobuf encodes damage in doubled fixed-point units.
+
 Apply `schema/003_assets.sql` after `schema/002_matches.sql` so
 `match_player_items_with_assets` can resolve timeline IDs from the hero/item
 snapshots. The view uses the asset payload's `type` field to distinguish

@@ -56,6 +56,29 @@ CREATE TABLE IF NOT EXISTS singularity.match_player_items
 ENGINE = ReplacingMergeTree(metadata_version)
 ORDER BY (match_id, player_slot, game_time_s, item_id, upgrade_id, upgrade_info);
 
+CREATE TABLE IF NOT EXISTS singularity.match_damage
+(
+    match_id UInt64,
+    dealer_slot UInt32,
+    target_slot UInt32,
+    source_details_index UInt32,
+    stat_type Int32,
+    source_name String,
+    sample_time_s UInt32,
+    raw_cumulative_damage UInt32,
+    cumulative_damage Float64,
+    metadata_version UInt64
+)
+ENGINE = ReplacingMergeTree(metadata_version)
+ORDER BY (
+    match_id,
+    dealer_slot,
+    target_slot,
+    source_details_index,
+    stat_type,
+    sample_time_s
+);
+
 CREATE TABLE IF NOT EXISTS singularity.match_player_stats
 (
     match_id UInt64,
@@ -115,6 +138,60 @@ SELECT
     (toFloat64(ifNull(kills, 0)) + toFloat64(ifNull(assists, 0)))
         / greatest(toFloat64(ifNull(deaths, 0)), 1.0) AS kda
 FROM singularity.match_players;
+
+CREATE VIEW IF NOT EXISTS singularity.match_damage_totals AS
+SELECT
+    match_id,
+    dealer_slot,
+    target_slot,
+    source_details_index,
+    stat_type,
+    source_name,
+    argMax(cumulative_damage, sample_time_s) AS total_damage
+FROM singularity.match_damage
+GROUP BY
+    match_id,
+    dealer_slot,
+    target_slot,
+    source_details_index,
+    stat_type,
+    source_name;
+
+CREATE VIEW IF NOT EXISTS singularity.match_damage_player_reconciliation AS
+WITH matrix_totals AS
+(
+    SELECT
+        damage.match_id,
+        damage.dealer_slot,
+        sum(damage.total_damage) AS matrix_player_damage
+    FROM singularity.match_damage_totals AS damage
+    INNER JOIN singularity.match_players AS targets
+        ON targets.match_id = damage.match_id
+        AND targets.player_slot = damage.target_slot
+    WHERE damage.stat_type = 0
+    GROUP BY damage.match_id, damage.dealer_slot
+),
+timeline_totals AS
+(
+    SELECT
+        match_id,
+        player_slot,
+        argMax(ifNull(player_damage, 0), snapshot_time_s) AS timeline_player_damage
+    FROM singularity.match_player_stats
+    GROUP BY match_id, player_slot
+)
+SELECT
+    matrix.match_id,
+    matrix.dealer_slot,
+    matrix.matrix_player_damage,
+    toFloat64(timeline.timeline_player_damage) AS timeline_player_damage,
+    matrix.matrix_player_damage - toFloat64(timeline.timeline_player_damage)
+        AS damage_difference,
+    abs(damage_difference) < 0.000001 AS matches_player_damage
+FROM matrix_totals AS matrix
+INNER JOIN timeline_totals AS timeline
+    ON timeline.match_id = matrix.match_id
+    AND timeline.player_slot = matrix.dealer_slot;
 
 CREATE VIEW IF NOT EXISTS singularity.match_player_stats_with_derived AS
 SELECT
