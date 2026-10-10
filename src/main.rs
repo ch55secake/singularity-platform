@@ -2,6 +2,7 @@
 #![deny(clippy::all)]
 
 mod metadata;
+mod parser;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -111,6 +112,7 @@ enum CredentialCommand {
 enum Command {
     Credentials(CredentialCommand),
     MetadataWorker,
+    MetadataParser,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -151,6 +153,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return match command {
             Command::Credentials(command) => run_credential_command(command).await,
             Command::MetadataWorker => metadata::run().await,
+            Command::MetadataParser => parser::run().await,
         };
     }
 
@@ -519,6 +522,12 @@ fn parse_command(mut args: impl Iterator<Item = String>) -> Result<Option<Comman
             return Err("unexpected metadata worker argument".to_string());
         }
         return Ok(Some(Command::MetadataWorker));
+    }
+    if command == "metadata-parser" {
+        if args.next().is_some() {
+            return Err("unexpected metadata parser argument".to_string());
+        }
+        return Ok(Some(Command::MetadataParser));
     }
     if command != "credentials" && command != "credential" {
         return Err("unknown command".to_string());
