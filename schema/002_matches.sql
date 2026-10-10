@@ -79,6 +79,26 @@ ORDER BY (
     sample_time_s
 );
 
+CREATE TABLE IF NOT EXISTS singularity.match_deaths
+(
+    match_id UInt64,
+    victim_slot UInt32,
+    death_index UInt32,
+    killer_slot UInt32,
+    game_time_s UInt32,
+    time_to_kill_s Nullable(Float32),
+    victim_x Nullable(Float32),
+    victim_y Nullable(Float32),
+    victim_z Nullable(Float32),
+    killer_x Nullable(Float32),
+    killer_y Nullable(Float32),
+    killer_z Nullable(Float32),
+    death_duration_s UInt32,
+    metadata_version UInt64
+)
+ENGINE = ReplacingMergeTree(metadata_version)
+ORDER BY (match_id, victim_slot, game_time_s, death_index);
+
 CREATE TABLE IF NOT EXISTS singularity.match_player_stats
 (
     match_id UInt64,
@@ -192,6 +212,48 @@ FROM matrix_totals AS matrix
 INNER JOIN timeline_totals AS timeline
     ON timeline.match_id = matrix.match_id
     AND timeline.player_slot = matrix.dealer_slot;
+
+CREATE VIEW IF NOT EXISTS singularity.match_deaths_with_players AS
+SELECT
+    deaths.*,
+    victim.hero_id AS victim_hero_id,
+    victim.team AS victim_team,
+    killer.hero_id AS killer_hero_id,
+    killer.team AS killer_team
+FROM singularity.match_deaths AS deaths
+LEFT JOIN singularity.match_players AS victim
+    ON victim.match_id = deaths.match_id
+    AND victim.player_slot = deaths.victim_slot
+LEFT JOIN singularity.match_players AS killer
+    ON killer.match_id = deaths.match_id
+    AND killer.player_slot = deaths.killer_slot;
+
+CREATE VIEW IF NOT EXISTS singularity.match_death_count_reconciliation AS
+WITH death_counts AS
+(
+    SELECT match_id, victim_slot, count() AS recorded_deaths
+    FROM singularity.match_deaths
+    GROUP BY match_id, victim_slot
+),
+scoreboard AS
+(
+    SELECT
+        match_id,
+        player_slot,
+        max(ifNull(deaths, 0)) AS scoreboard_deaths
+    FROM singularity.match_players
+    GROUP BY match_id, player_slot
+)
+SELECT
+    scoreboard.match_id,
+    scoreboard.player_slot,
+    ifNull(death_counts.recorded_deaths, toUInt64(0)) AS recorded_deaths,
+    toUInt64(scoreboard.scoreboard_deaths) AS scoreboard_deaths,
+    recorded_deaths = scoreboard_deaths AS matches_scoreboard
+FROM scoreboard
+LEFT JOIN death_counts
+    ON death_counts.match_id = scoreboard.match_id
+    AND death_counts.victim_slot = scoreboard.player_slot;
 
 CREATE VIEW IF NOT EXISTS singularity.match_player_stats_with_derived AS
 SELECT

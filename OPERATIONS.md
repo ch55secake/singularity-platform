@@ -89,6 +89,11 @@ Damage matrix samples are written to `match_damage`; query
 totals against each player's final `player_damage` value. The raw matrix value
 is retained because the protobuf encodes damage in doubled fixed-point units.
 
+Death events are written to `match_deaths` with nullable position fields for
+older or incomplete metadata. Use `match_deaths_with_players` for hero/team
+labels and `match_death_count_reconciliation` to verify that recorded deaths
+match the scoreboard.
+
 Apply `schema/003_assets.sql` after `schema/002_matches.sql` so
 `match_player_items_with_assets` can resolve timeline IDs from the hero/item
 snapshots. The view uses the asset payload's `type` field to distinguish
