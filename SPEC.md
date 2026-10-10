@@ -102,6 +102,13 @@ duration. `match_deaths_with_players` joins both slots to scoreboard hero/team
 data. `match_death_count_reconciliation` compares recorded victim counts with
 the parsed scoreboard `deaths` totals.
 
+The parser expands `match_info.match_paths.paths[]` into
+`match_player_positions`. For each sample, world coordinates use
+`world = min + position / resolution * (max - min)` independently for X and Y.
+Combat types are `0=out`, `1=player`, `2=enemy NPC`, and `3=neutral`; movement
+types are `0=normal`, `1=ability`, `2=ability debuff`, `3=ground dash`,
+`4=slide`, `5=rope climbing`, `6=ziplining`, `7=in air`, and `8=air dash`.
+
 The `assets-sync` command snapshots the public heroes, items, modifiers, and
 map assets into the `schema/003_assets.sql` lookup tables. Snapshot hashes make
 repeated refreshes idempotent, and the map snapshot records the minimap URL and

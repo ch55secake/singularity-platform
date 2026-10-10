@@ -94,6 +94,14 @@ older or incomplete metadata. Use `match_deaths_with_players` for hero/team
 labels and `match_death_count_reconciliation` to verify that recorded deaths
 match the scoreboard.
 
+Player paths are written to `match_player_positions` as world coordinates. A
+sample match with 32 minutes, 12 players, and one-second samples produces
+approximately 23,040 rows; ClickHouse's compact numeric schema keeps this at
+well below a megabyte in the local smoke estimate before replication. To check
+alignment, compare a death's `game_time_s` with the matching victim path
+sample; the sample metadata's nearest point is within a few world units of
+`death_pos`.
+
 Apply `schema/003_assets.sql` after `schema/002_matches.sql` so
 `match_player_items_with_assets` can resolve timeline IDs from the hero/item
 snapshots. The view uses the asset payload's `type` field to distinguish

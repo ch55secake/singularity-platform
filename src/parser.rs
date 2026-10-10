@@ -156,6 +156,20 @@ struct DeathRow {
     metadata_version: u64,
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct PlayerPositionRow {
+    match_id: u64,
+    player_slot: u32,
+    sample_index: u32,
+    time_s: f32,
+    x: Option<f32>,
+    y: Option<f32>,
+    health: Option<u32>,
+    combat_type: Option<i32>,
+    move_type: Option<i32>,
+    metadata_version: u64,
+}
+
 #[derive(Debug)]
 struct ParsedMatch {
     match_row: MatchRow,
@@ -164,6 +178,7 @@ struct ParsedMatch {
     item_rows: Vec<PlayerItemRow>,
     damage_rows: Vec<DamageRow>,
     death_rows: Vec<DeathRow>,
+    position_rows: Vec<PlayerPositionRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -240,6 +255,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         clickhouse
             .insert("match_deaths", DEATH_COLUMNS, &parsed.death_rows)
             .await?;
+        clickhouse
+            .insert(
+                "match_player_positions",
+                POSITION_COLUMNS,
+                &parsed.position_rows,
+            )
+            .await?;
         state
             .processed
             .insert(job_id.to_string(), parsed.match_row.metadata_version);
@@ -258,6 +280,7 @@ const STAT_COLUMNS: &str = "match_id, account_id, player_slot, snapshot_time_s, 
 const ITEM_COLUMNS: &str = "match_id, player_slot, game_time_s, item_id, upgrade_id, sold_time_s, flags, imbued_ability_id, upgrade_info, upgrade_unlocked, upgrade_tier, metadata_version";
 const DAMAGE_COLUMNS: &str = "match_id, dealer_slot, target_slot, source_details_index, stat_type, source_name, sample_time_s, raw_cumulative_damage, cumulative_damage, metadata_version";
 const DEATH_COLUMNS: &str = "match_id, victim_slot, death_index, killer_slot, game_time_s, time_to_kill_s, victim_x, victim_y, victim_z, killer_x, killer_y, killer_z, death_duration_s, metadata_version";
+const POSITION_COLUMNS: &str = "match_id, player_slot, sample_index, time_s, x, y, health, combat_type, move_type, metadata_version";
 
 impl ClickHouseClient {
     fn from_env() -> Result<Self, std::io::Error> {
@@ -430,6 +453,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
     let mut item_rows = Vec::new();
     let damage_rows = damage_rows(match_id, info.damage_matrix.as_ref(), metadata_version);
     let death_rows = death_rows(match_id, &info.players, metadata_version);
+    let position_rows = position_rows(match_id, info.match_paths.as_ref(), metadata_version);
     for player in info.players {
         player_rows.push(player_row(match_id, &player, metadata_version));
         item_rows.extend(
@@ -452,6 +476,7 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
         item_rows,
         damage_rows,
         death_rows,
+        position_rows,
     })
 }
 
@@ -651,6 +676,72 @@ fn position_fields(position: Option<&Position>) -> (Option<f32>, Option<f32>, Op
         .unwrap_or((None, None, None))
 }
 
+fn position_rows(
+    match_id: u64,
+    paths: Option<&valveprotos::deadlock::CMsgMatchPlayerPathsData>,
+    metadata_version: u64,
+) -> Vec<PlayerPositionRow> {
+    let Some(paths) = paths else {
+        return Vec::new();
+    };
+    let interval_s = paths.interval_s.unwrap_or(1.0);
+    let x_resolution = paths.x_resolution.unwrap_or_default();
+    let y_resolution = paths.y_resolution.unwrap_or_default();
+    let mut rows = Vec::new();
+    for path in &paths.paths {
+        let sample_count = [
+            path.x_pos.len(),
+            path.y_pos.len(),
+            path.health.len(),
+            path.combat_type.len(),
+            path.move_type.len(),
+        ]
+        .into_iter()
+        .max()
+        .unwrap_or_default();
+        for sample_index in 0..sample_count {
+            let x = world_coordinate(
+                path.x_min,
+                path.x_max,
+                path.x_pos.get(sample_index).copied(),
+                x_resolution,
+            );
+            let y = world_coordinate(
+                path.y_min,
+                path.y_max,
+                path.y_pos.get(sample_index).copied(),
+                y_resolution,
+            );
+            rows.push(PlayerPositionRow {
+                match_id,
+                player_slot: path.player_slot.unwrap_or_default(),
+                sample_index: sample_index as u32,
+                time_s: sample_index as f32 * interval_s,
+                x,
+                y,
+                health: path.health.get(sample_index).copied(),
+                combat_type: path.combat_type.get(sample_index).copied(),
+                move_type: path.move_type.get(sample_index).copied(),
+                metadata_version,
+            });
+        }
+    }
+    rows
+}
+
+fn world_coordinate(
+    minimum: Option<f32>,
+    maximum: Option<f32>,
+    position: Option<u32>,
+    resolution: u32,
+) -> Option<f32> {
+    let (minimum, maximum, position) = (minimum?, maximum?, position?);
+    if resolution == 0 {
+        return None;
+    }
+    Some(minimum + position as f32 / resolution as f32 * (maximum - minimum))
+}
+
 fn metadata_version(bytes: &[u8]) -> u64 {
     let digest = Sha256::digest(bytes);
     u64::from_le_bytes(digest[..8].try_into().expect("digest has eight bytes"))
@@ -665,6 +756,7 @@ mod tests {
     use valveprotos::deadlock::c_msg_match_player_damage_matrix::{
         DamageDealer, DamageSource, DamageToPlayer, SourceDetails,
     };
+    use valveprotos::deadlock::c_msg_match_player_paths_data::Path as PlayerPath;
 
     #[test]
     fn decodes_match_players_and_timeline_rows() {
@@ -672,6 +764,24 @@ mod tests {
             match_info: Some(MatchInfo {
                 match_id: Some(42),
                 duration_s: Some(1_800),
+                match_paths: Some(valveprotos::deadlock::CMsgMatchPlayerPathsData {
+                    version: Some(1),
+                    interval_s: Some(1.0),
+                    x_resolution: Some(100),
+                    y_resolution: Some(200),
+                    paths: vec![PlayerPath {
+                        player_slot: Some(3),
+                        x_min: Some(-10.0),
+                        y_min: Some(-20.0),
+                        x_max: Some(10.0),
+                        y_max: Some(20.0),
+                        x_pos: vec![0, 50],
+                        y_pos: vec![100, 200],
+                        health: vec![100, 90],
+                        combat_type: vec![1, 2],
+                        move_type: vec![0, 3],
+                    }],
+                }),
                 damage_matrix: Some(valveprotos::deadlock::CMsgMatchPlayerDamageMatrix {
                     damage_dealers: vec![DamageDealer {
                         dealer_player_slot: Some(3),
@@ -767,6 +877,13 @@ mod tests {
         assert_eq!(parsed.death_rows[0].killer_slot, 4);
         assert_eq!(parsed.death_rows[0].victim_x, Some(10.0));
         assert_eq!(parsed.death_rows[0].killer_z, Some(60.0));
+        assert_eq!(parsed.position_rows.len(), 2);
+        assert_eq!(parsed.position_rows[0].x, Some(-10.0));
+        assert_eq!(parsed.position_rows[0].y, Some(0.0));
+        assert_eq!(parsed.position_rows[1].x, Some(0.0));
+        assert_eq!(parsed.position_rows[1].y, Some(20.0));
+        assert_eq!(parsed.position_rows[1].combat_type, Some(2));
+        assert_eq!(parsed.position_rows[1].move_type, Some(3));
         assert_eq!(parsed.damage_rows.len(), 2);
         assert_eq!(parsed.damage_rows[1].source_name, "ability_test");
         assert_eq!(parsed.damage_rows[1].sample_time_s, 120);
