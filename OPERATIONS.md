@@ -14,10 +14,15 @@
 | `SINGULARITY_METADATA_SPOOL_PATH` | `SINGULARITY_SPOOL_PATH` | Worker spool override |
 | `SINGULARITY_METADATA_STATE_PATH` | `data/metadata-state.json` | Metadata job state |
 | `SINGULARITY_METADATA_OUTPUT_DIR` | `data/metadata` | Decompressed metadata handoff files |
+| `SINGULARITY_METADATA_PARSE_STATE_PATH` | `data/metadata-parse-state.json` | Parser idempotency state |
 | `SINGULARITY_METADATA_BASE_URL` | `http://replay{cluster}.valve.net/1422450` | Metadata URL base |
 | `SINGULARITY_METADATA_TIMEOUT_SECONDS` | `30` | Per-download timeout |
 | `SINGULARITY_METADATA_RETRY_BASE_SECONDS` | `30` | Initial retry delay |
 | `SINGULARITY_METADATA_RETRY_MAX_SECONDS` | `3600` | Maximum retry delay |
+| `SINGULARITY_CLICKHOUSE_URL` | unset | ClickHouse HTTP endpoint for parser |
+| `SINGULARITY_CLICKHOUSE_DATABASE` | `singularity` | ClickHouse database |
+| `SINGULARITY_CLICKHOUSE_USER` | unset | ClickHouse user |
+| `SINGULARITY_CLICKHOUSE_PASSWORD` | unset | ClickHouse password |
 | `RUST_LOG` | `singularity_platform=info` | Logging filter |
 
 ## Collector credentials
@@ -59,6 +64,19 @@ under `SINGULARITY_METADATA_OUTPUT_DIR`. The state file records
 `metadata_pending`/`metadata_processed`, attempts, retry time, and a bounded
 error code without storing the URL or salt. Failed downloads use exponential
 backoff, including 404 and 5xx responses.
+
+After a successful download, apply `schema/002_matches.sql` and run the
+parser against the ClickHouse HTTP endpoint:
+
+```bash
+SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  singularity-platform metadata-parser
+```
+
+The parser writes match, player, and player-timeline rows as JSONEachRow and
+records processed job digests in `SINGULARITY_METADATA_PARSE_STATE_PATH`.
+ReplacingMergeTree tables and the derived view make repeated parsing
+idempotent.
 
 ## Recovery
 
