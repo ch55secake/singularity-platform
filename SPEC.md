@@ -73,7 +73,12 @@ The `metadata-parser` command decodes the protobuf handoff with the pinned
 Deadlock `valveprotos` definitions and inserts match, player, and timeline rows
 into ClickHouse using JSONEachRow. It tracks processed job digests separately
 and uses the `schema/002_matches.sql` ReplacingMergeTree tables for idempotent
-re-parsing.
+re-parsing. Timeline rows include the upstream aim, kill-type, damage,
+mitigation, healing, power, and health counters. The derived views expose
+accuracy, hero crit rate, mutually exclusive bullet/ability/melee kill shares,
+headshot kill share, and damage taken per minute. Per-account averages use the
+last snapshot in each match; `headshot_kills` is a subset of `bullet_kills` and
+is therefore not included in the kill-share denominator.
 
 The `assets-sync` command snapshots the public heroes, items, modifiers, and
 map assets into the `schema/003_assets.sql` lookup tables. Snapshot hashes make
