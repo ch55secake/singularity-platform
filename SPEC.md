@@ -31,8 +31,9 @@ must not be used in production.
 
 The platform exposes the browser-facing read contract at `/api/matches`,
 `/api/matches/{uuid}`, `/api/matches/{uuid}/positions`,
-`/api/matches/{uuid}/deaths`, and `/api/players/{account_id}`. Equivalent paths
-without the `/api` prefix are available for direct LAN clients. Reads use a
+`/api/matches/{uuid}/deaths`, `/api/players/{account_id}`, and
+`/api/players/by-name/{name}`. Equivalent paths without the `/api` prefix are
+available for direct LAN clients. Reads use a
 separate optional `SINGULARITY_READ_TOKEN`; when it is unset, LAN-only network
 isolation is the authentication boundary. Read queries are issued only when a
 request arrives, so health and process startup do not require ClickHouse.
@@ -42,6 +43,10 @@ in parser state. Numeric match IDs remain accepted for migration and direct
 operator use. The response hides Steam account IDs, resolves heroes and items
 through the asset snapshots, and maps configured account IDs to friend names
 from `SINGULARITY_MEMBER_NAMES_JSON`.
+
+The by-name player endpoint is restricted to those configured member names and
+returns aggregate form, favourite heroes, and recent match rows. It lets the
+browser link to a player page without exposing or accepting a Steam account ID.
 
 The match detail response includes the final player-stat snapshot, every stats
 timeline row, source-normalized damage, item/ability events, death events,

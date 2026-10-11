@@ -189,6 +189,7 @@ pub(crate) struct MatchDetail {
 
 #[derive(Debug, Serialize)]
 pub(crate) struct PlayerAverage {
+    name: String,
     matches: u64,
     kdr: f64,
     kda: f64,
@@ -196,6 +197,7 @@ pub(crate) struct PlayerAverage {
     crit_rate: f64,
     win_rate: f64,
     heroes: Vec<HeroAverage>,
+    recent: Vec<RecentMatch>,
 }
 
 #[derive(Debug, Serialize)]
@@ -203,6 +205,20 @@ struct HeroAverage {
     id: u32,
     name: String,
     matches: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct RecentMatch {
+    uuid: String,
+    match_id: u64,
+    start_time: u32,
+    duration_s: u32,
+    winning_team: i32,
+    team: i32,
+    hero: Hero,
+    kills: u32,
+    deaths: u32,
+    assists: u32,
 }
 
 #[derive(Debug, Clone)]
@@ -421,7 +437,26 @@ pub(crate) async fn get_player(
     Path(account_id): Path<u32>,
 ) -> Result<Json<PlayerAverage>, (StatusCode, Json<ErrorBody>)> {
     authorize(&headers, &state.read_api)?;
-    let summary = query_player_average(&state.read_api, account_id).await?;
+    let summary = query_player_average(&state.read_api, account_id, String::new()).await?;
+    Ok(Json(summary))
+}
+
+pub(crate) async fn get_player_by_name(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Result<Json<PlayerAverage>, (StatusCode, Json<ErrorBody>)> {
+    authorize(&headers, &state.read_api)?;
+    let Some((account_id, canonical_name)) = state
+        .read_api
+        .members
+        .iter()
+        .find(|(_, member_name)| member_name.eq_ignore_ascii_case(&name))
+        .map(|(account_id, member_name)| (*account_id, member_name.clone()))
+    else {
+        return Err(api_error(StatusCode::NOT_FOUND, "player not found"));
+    };
+    let summary = query_player_average(&state.read_api, account_id, canonical_name).await?;
     Ok(Json(summary))
 }
 
@@ -1000,6 +1035,7 @@ fn build_player(
 async fn query_player_average(
     state: &ReadApiState,
     account_id: u32,
+    name: String,
 ) -> Result<PlayerAverage, (StatusCode, Json<ErrorBody>)> {
     let sql = format!(
         "SELECT count() AS matches, sum(kills) AS kills, sum(deaths) AS deaths, sum(assists) AS assists, sum(shots_hit) AS shots_hit, sum(shots_missed) AS shots_missed, sum(hero_hits) AS hero_hits, sum(hero_crits) AS hero_crits, sum(if(match_rows.winning_team = players.team, 1, 0)) AS wins FROM (SELECT match_id, player_slot, argMax(ifNull(kills, 0), snapshot_time_s) AS kills, argMax(ifNull(deaths, 0), snapshot_time_s) AS deaths, argMax(ifNull(assists, 0), snapshot_time_s) AS assists, argMax(ifNull(shots_hit, 0), snapshot_time_s) AS shots_hit, argMax(ifNull(shots_missed, 0), snapshot_time_s) AS shots_missed, argMax(ifNull(hero_bullets_hit, 0), snapshot_time_s) AS hero_hits, argMax(ifNull(hero_bullets_hit_crit, 0), snapshot_time_s) AS hero_crits FROM {db}.match_player_stats WHERE account_id = {account_id} GROUP BY match_id, player_slot) AS stats LEFT JOIN (SELECT match_id, player_slot, any(team) AS team FROM {db}.match_players WHERE account_id = {account_id} GROUP BY match_id, player_slot) AS players ON players.match_id = stats.match_id AND players.player_slot = stats.player_slot INNER JOIN {db}.matches AS match_rows ON match_rows.match_id = stats.match_id",
@@ -1022,7 +1058,9 @@ async fn query_player_average(
     let hero_crits = number_f64(row, "hero_crits");
     let wins = number_f64(row, "wins");
     let heroes = query_player_heroes(state, account_id).await?;
+    let recent = query_player_recent(state, account_id).await?;
     Ok(PlayerAverage {
+        name,
         matches,
         kdr: kills / deaths.max(1.0),
         kda: (kills + assists) / deaths.max(1.0),
@@ -1030,6 +1068,7 @@ async fn query_player_average(
         crit_rate: hero_crits / hero_hits.max(1.0),
         win_rate: wins / matches as f64,
         heroes,
+        recent,
     })
 }
 
@@ -1049,6 +1088,42 @@ async fn query_player_heroes(
                 id: number_u32(&row, "hero_id")?,
                 name: non_empty_string(&row, "hero_name").unwrap_or_else(|| "Unknown".to_string()),
                 matches: number_u64(&row, "matches").unwrap_or_default(),
+            })
+        })
+        .collect())
+}
+
+async fn query_player_recent(
+    state: &ReadApiState,
+    account_id: u32,
+) -> Result<Vec<RecentMatch>, (StatusCode, Json<ErrorBody>)> {
+    let sql = format!(
+        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m INNER JOIN {db}.match_players AS p ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE p.account_id = {account_id} ORDER BY m.start_time DESC, m.match_id DESC LIMIT 20",
+        db = state.database,
+    );
+    let rows = query_rows(state, &sql).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            let match_id = number_u64(&row, "match_id")?;
+            Some(RecentMatch {
+                uuid: non_empty_string(&row, "uuid").unwrap_or_else(|| match_id.to_string()),
+                match_id,
+                start_time: number_u32(&row, "start_time").unwrap_or_default(),
+                duration_s: number_u32(&row, "duration_s").unwrap_or_default(),
+                winning_team: number_i32(&row, "winning_team").unwrap_or_default(),
+                team: number_i32(&row, "team").unwrap_or_default(),
+                hero: Hero {
+                    id: number_u32(&row, "hero_id").unwrap_or_default(),
+                    name: non_empty_string(&row, "hero_name")
+                        .unwrap_or_else(|| "Unknown".to_string()),
+                    icon: non_empty_string(&row, "hero_icon")
+                        .or_else(|| non_empty_string(&row, "hero_image")),
+                    card: non_empty_string(&row, "hero_card"),
+                },
+                kills: number_u32(&row, "kills").unwrap_or_default(),
+                deaths: number_u32(&row, "deaths").unwrap_or_default(),
+                assists: number_u32(&row, "assists").unwrap_or_default(),
             })
         })
         .collect())
@@ -1122,5 +1197,15 @@ mod tests {
         assert_eq!(matches[0].players[0].member.as_ref().unwrap().name, "oscar");
         assert_eq!(matches[1].uuid, "old");
         assert!(matches[1].players[0].member.is_none());
+    }
+
+    #[test]
+    fn member_name_lookup_is_case_insensitive() {
+        let members = HashMap::from([(42_u32, "Cheesecake".to_string())]);
+        let found = members
+            .iter()
+            .find(|(_, name)| name.eq_ignore_ascii_case("cheesecake"))
+            .map(|(account_id, name)| (*account_id, name.clone()));
+        assert_eq!(found, Some((42, "Cheesecake".to_string())));
     }
 }

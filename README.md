@@ -78,6 +78,7 @@ The read API is available after applying the match and asset schemas:
 ```bash
 curl http://127.0.0.1:8080/api/matches
 curl http://127.0.0.1:8080/api/matches/<uuid>
+curl http://127.0.0.1:8080/api/players/by-name/<member-name>
 ```
 
 Set `SINGULARITY_READ_TOKEN` to protect reads with a separate bearer token.
