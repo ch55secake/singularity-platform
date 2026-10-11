@@ -232,6 +232,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/players/{account_id}", get(read_api::get_player))
         .route("/api/players/{account_id}", get(read_api::get_player))
+        .route("/players/by-name/{name}", get(read_api::get_player_by_name))
+        .route(
+            "/api/players/by-name/{name}",
+            get(read_api::get_player_by_name),
+        )
         .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
         .with_state(state);
 

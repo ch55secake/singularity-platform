@@ -122,6 +122,7 @@ GET /api/matches/{uuid}
 GET /api/matches/{uuid}/positions
 GET /api/matches/{uuid}/deaths
 GET /api/players/{account_id}
+GET /api/players/by-name/{name}
 ```
 
 Read access is LAN-only by deployment policy and has no authentication by
