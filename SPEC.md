@@ -147,12 +147,13 @@ Planned states:
 
 ```text
 received → metadata_pending → metadata_processed
-         → replay_pending   → replay_processed
+         → replay_pending   → replay_downloaded → replay_parsed
          → analytics_written
 ```
 
-Failures must be recorded with retry count and last error. The server must not
-require a Steam account in any stage.
+The replay worker records retry count, next retry time, and a bounded last error
+for failed downloads or parses. The server must not require a Steam account in
+any stage.
 
 ## Acceptance criteria
 

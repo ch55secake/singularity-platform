@@ -5,6 +5,7 @@ mod assets;
 mod metadata;
 mod parser;
 mod read_api;
+mod replay;
 
 use std::{
     collections::{BTreeMap, HashMap, HashSet},
@@ -116,6 +117,7 @@ enum Command {
     Credentials(CredentialCommand),
     MetadataWorker,
     MetadataParser,
+    ReplayWorker,
     AssetsSync,
 }
 
@@ -158,6 +160,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Command::Credentials(command) => run_credential_command(command).await,
             Command::MetadataWorker => metadata::run().await,
             Command::MetadataParser => parser::run().await,
+            Command::ReplayWorker => replay::run().await,
             Command::AssetsSync => assets::run().await,
         };
     }
@@ -559,6 +562,12 @@ fn parse_command(mut args: impl Iterator<Item = String>) -> Result<Option<Comman
             return Err("unexpected metadata parser argument".to_string());
         }
         return Ok(Some(Command::MetadataParser));
+    }
+    if command == "replay-worker" {
+        if args.next().is_some() {
+            return Err("unexpected replay worker argument".to_string());
+        }
+        return Ok(Some(Command::ReplayWorker));
     }
     if command == "assets-sync" {
         if args.next().is_some() {
