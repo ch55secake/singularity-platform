@@ -2,6 +2,7 @@
 #![deny(clippy::all)]
 
 mod assets;
+mod discord;
 mod metadata;
 mod parser;
 mod read_api;
@@ -119,6 +120,7 @@ enum Command {
     MetadataParser,
     ReplayWorker,
     AssetsSync,
+    DiscordBot,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -162,6 +164,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Command::MetadataParser => parser::run().await,
             Command::ReplayWorker => replay::run().await,
             Command::AssetsSync => assets::run().await,
+            Command::DiscordBot => discord::run().await,
         };
     }
 
@@ -217,6 +220,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .route("/health", get(health))
         .route("/ingest/salts", post(ingest_salts))
         .route("/matches", get(read_api::list_matches))
+        .route("/events/matches", get(read_api::list_processed_events))
         .route("/matches/{identifier}", get(read_api::get_match))
         .route(
             "/matches/{identifier}/positions",
@@ -224,6 +228,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         )
         .route("/matches/{identifier}/deaths", get(read_api::get_deaths))
         .route("/api/matches", get(read_api::list_matches))
+        .route("/api/events/matches", get(read_api::list_processed_events))
         .route("/api/matches/{identifier}", get(read_api::get_match))
         .route(
             "/api/matches/{identifier}/positions",
@@ -574,6 +579,12 @@ fn parse_command(mut args: impl Iterator<Item = String>) -> Result<Option<Comman
             return Err("unexpected assets sync argument".to_string());
         }
         return Ok(Some(Command::AssetsSync));
+    }
+    if command == "discord-bot" {
+        if args.next().is_some() {
+            return Err("unexpected discord bot argument".to_string());
+        }
+        return Ok(Some(Command::DiscordBot));
     }
     if command != "credentials" && command != "credential" {
         return Err("unknown command".to_string());

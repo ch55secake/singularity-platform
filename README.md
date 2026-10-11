@@ -59,7 +59,8 @@ singularity-platform metadata-worker
 It writes decompressed metadata handoff files and restart-safe job state under
 `data/` by default. No Steam login or Steam credentials are used.
 
-After applying `schema/002_matches.sql`, load those files into ClickHouse with:
+After applying `schema/002_matches.sql` and `schema/005_match_events.sql`, load
+those files into ClickHouse with:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
@@ -97,5 +98,20 @@ curl http://127.0.0.1:8080/api/players/by-name/<member-name>
 Set `SINGULARITY_READ_TOKEN` to protect reads with a separate bearer token.
 Use `SINGULARITY_MEMBER_NAMES_JSON` to resolve consenting friends' account IDs
 to display names; account IDs are never returned by the browser API.
+
+Run the optional Discord bot separately from the platform HTTP service:
+
+```bash
+SINGULARITY_DISCORD_TOKEN=replace-me \
+SINGULARITY_DISCORD_CHANNEL_ID=123456789012345678 \
+SINGULARITY_DISCORD_GUILD_ID=123456789012345678 \
+  singularity-platform discord-bot
+```
+
+Configure `SINGULARITY_DISCORD_READ_TOKEN` when the read API is protected. The
+bot uses only the read API, posts newly processed group matches once, and
+provides `/link`, `/last`, `/match`, `/stats`, and `/leaderboard`. Apply
+`schema/005_match_events.sql` so the parser can publish the notification
+cursor.
 
 See [`SPEC.md`](SPEC.md) for the service contract.
