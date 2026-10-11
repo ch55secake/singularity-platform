@@ -19,6 +19,17 @@
 | `SINGULARITY_METADATA_TIMEOUT_SECONDS` | `30` | Per-download timeout |
 | `SINGULARITY_METADATA_RETRY_BASE_SECONDS` | `30` | Initial retry delay |
 | `SINGULARITY_METADATA_RETRY_MAX_SECONDS` | `3600` | Maximum retry delay |
+| `SINGULARITY_REPLAY_SPOOL_PATH` | `SINGULARITY_SPOOL_PATH` | Replay worker spool override |
+| `SINGULARITY_REPLAY_STATE_PATH` | `data/replay-state.json` | Replay job state |
+| `SINGULARITY_REPLAY_OUTPUT_DIR` | `data/replays` | Temporary decompressed demos |
+| `SINGULARITY_REPLAY_BASE_URL` | `http://replay{cluster}.valve.net/1422450` | Replay URL base |
+| `SINGULARITY_REPLAY_TIMEOUT_SECONDS` | `60` | Per-download and ClickHouse timeout |
+| `SINGULARITY_REPLAY_RETRY_BASE_SECONDS` | `30` | Initial retry delay |
+| `SINGULARITY_REPLAY_RETRY_MAX_SECONDS` | `3600` | Maximum retry delay |
+| `SINGULARITY_REPLAY_MAX_COMPRESSED_BYTES` | `536870912` | Download size limit |
+| `SINGULARITY_REPLAY_MAX_DECOMPRESSED_BYTES` | `2147483648` | Expanded demo size limit |
+| `SINGULARITY_REPLAY_MAX_DISK_BYTES` | `34359738368` | Replay spool disk reservation |
+| `SINGULARITY_REPLAY_DEBUG_RETENTION_SECONDS` | `0` | Raw demo retention after parse |
 | `SINGULARITY_CLICKHOUSE_URL` | unset | ClickHouse HTTP endpoint for parser |
 | `SINGULARITY_CLICKHOUSE_DATABASE` | `singularity` | ClickHouse database |
 | `SINGULARITY_CLICKHOUSE_USER` | unset | ClickHouse user |
@@ -86,6 +97,27 @@ and health counters used by the derived views. `player_stat_averages` selects
 the last snapshot for each player in each match before averaging across
 matches. ReplacingMergeTree tables and the parser state make repeated parsing
 idempotent.
+
+## Replay worker
+
+Apply `schema/004_replays.sql`, then run one restart-safe replay pass after
+metadata ingestion:
+
+```bash
+SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  singularity-platform replay-worker
+```
+
+The worker selects records with a `replay_salt`, downloads the replay from the
+Valve CDN, accepts zstd payloads despite the `.dem.bz2` suffix, and parses
+player-pawn positions with the pinned Haste revision. State transitions are
+`replay_pending`, `replay_downloaded`, and `replay_parsed`; failures retain a
+bounded error code and exponential retry time without storing salts or URLs.
+Rows use deterministic model-version keys and ReplacingMergeTree, so a
+download or ClickHouse retry does not create a second logical match. Raw demos
+are deleted after successful parsing by default. Set
+`SINGULARITY_REPLAY_DEBUG_RETENTION_SECONDS` only when a bounded debug window is
+needed; expired retained files are removed on the next worker pass.
 
 Damage matrix samples are written to `match_damage`; query
 `match_damage_player_reconciliation` to compare the normalized stat-type-0

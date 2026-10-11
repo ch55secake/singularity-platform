@@ -5,9 +5,9 @@ tracker.
 
 ## Baseline
 
-The `v0.1.0-baseline` provides an authenticated salt-ingestion endpoint and a
-durable JSONL spool. It deliberately does not include Steam Game Coordinator
-access, replay downloading, or demo parsing yet.
+The platform provides an authenticated salt-ingestion endpoint, a durable JSONL
+spool, metadata processing, and an opt-in replay worker. It never uses Steam
+Game Coordinator access or server-side Steam credentials.
 
 Run locally:
 
@@ -65,6 +65,19 @@ After applying `schema/002_matches.sql`, load those files into ClickHouse with:
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
   singularity-platform metadata-parser
 ```
+
+After applying `schema/004_replays.sql`, run one replay download and parse pass
+with:
+
+```bash
+SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
+  singularity-platform replay-worker
+```
+
+The worker handles replay-salt records, parses Deadlock player-pawn positions
+with the pinned Haste revision, retries delayed or malformed downloads, and
+deletes raw demos after a successful parse unless a bounded debug retention
+window is configured.
 
 Refresh public name and image lookups with:
 

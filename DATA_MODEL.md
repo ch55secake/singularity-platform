@@ -30,6 +30,8 @@ tables are:
 | `match_player` | Detailed player and match statistics |
 | `player_match_history` | Per-account history rows |
 | `demo_player` | Demo-derived hero build and observed identity data |
+| `replay_matches` | Versioned Haste replay parse summaries |
+| `replay_positions` | Sampled Deadlock player-pawn positions from Haste demos |
 
 Salt values are credentials for Valve replay files and must not be exposed in
 logs or public API responses. Accepted salt records also retain the opaque

@@ -7,10 +7,12 @@ description = "Private Deadlock match ingestion platform for Singularity"
 license = "MIT"
 
 [dependencies]
+anyhow = "1"
 axum = "0.8"
 bzip2 = "0.6"
 getrandom = "0.4"
 hex = "0.4"
+haste = { git = "https://github.com/blukai/haste.git", rev = "7ce32e67ba107f256777a10fe0cb19b7812dd187", default-features = false, features = ["deadlock"] }
 prost = "0.14.4"
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls"] }
 serde = { version = "1", features = ["derive"] }
