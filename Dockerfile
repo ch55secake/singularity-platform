@@ -2,7 +2,7 @@ FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends protobuf-compiler \
+    && apt-get install --yes --no-install-recommends libssl-dev pkg-config protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 COPY Cargo.toml ./
 COPY Cargo.lock ./
@@ -12,7 +12,7 @@ RUN cargo build --release --locked
 FROM debian:bookworm-slim
 
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends ca-certificates \
+    && apt-get install --yes --no-install-recommends ca-certificates libssl3 \
     && rm -rf /var/lib/apt/lists/*
 
 COPY --from=builder /build/target/release/singularity-platform /usr/local/bin/singularity-platform
