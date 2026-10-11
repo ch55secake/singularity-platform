@@ -22,6 +22,7 @@ const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 100;
 const MAX_OFFSET: u32 = 10_000;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
+const MAX_PLAYER_MATCHES: u32 = 100;
 
 #[derive(Clone)]
 pub(crate) struct ReadApiState {
@@ -38,6 +39,18 @@ pub(crate) struct ReadApiState {
 pub(crate) struct ListQuery {
     limit: Option<u32>,
     offset: Option<u32>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct EventQuery {
+    limit: Option<u32>,
+    after_start_time: Option<u32>,
+    after_match_id: Option<u64>,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct PlayerQuery {
+    last: Option<u32>,
 }
 
 #[derive(Debug, Serialize, Clone)]
@@ -73,6 +86,13 @@ pub(crate) struct MatchSummary {
     mode: String,
     winning_team: i32,
     players: Vec<PlayerSummary>,
+}
+
+#[derive(Debug, Serialize)]
+pub(crate) struct MatchProcessedEvent {
+    uuid: String,
+    match_id: u64,
+    start_time: u32,
 }
 
 #[derive(Debug, Serialize)]
@@ -196,6 +216,7 @@ pub(crate) struct PlayerAverage {
     accuracy: f64,
     crit_rate: f64,
     win_rate: f64,
+    damage_per_minute: f64,
     heroes: Vec<HeroAverage>,
     recent: Vec<RecentMatch>,
 }
@@ -359,6 +380,40 @@ pub(crate) async fn list_matches(
     Ok(Json(group_core_rows(rows, &state.read_api.members)))
 }
 
+pub(crate) async fn list_processed_events(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<EventQuery>,
+) -> Result<Json<Vec<MatchProcessedEvent>>, (StatusCode, Json<ErrorBody>)> {
+    authorize(&headers, &state.read_api)?;
+    let limit = query.limit.unwrap_or(DEFAULT_LIMIT);
+    if limit == 0 || limit > MAX_LIMIT {
+        return Err(api_error(StatusCode::BAD_REQUEST, "invalid pagination"));
+    }
+    let after_start_time = query.after_start_time.unwrap_or_default();
+    let after_match_id = query.after_match_id.unwrap_or_default();
+    let sql = format!(
+        "SELECT public_id AS uuid, match_id, start_time FROM {db}.match_processed_events FINAL WHERE start_time > {after_start_time} OR (start_time = {after_start_time} AND match_id > {after_match_id}) ORDER BY start_time ASC, match_id ASC LIMIT {limit}",
+        db = state.read_api.database,
+    );
+    let rows = state
+        .read_api
+        .query(&sql)
+        .await
+        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "read backend unavailable"))?;
+    Ok(Json(
+        rows.into_iter()
+            .filter_map(|row| {
+                Some(MatchProcessedEvent {
+                    uuid: non_empty_string(&row, "uuid")?,
+                    match_id: number_u64(&row, "match_id")?,
+                    start_time: number_u32(&row, "start_time").unwrap_or_default(),
+                })
+            })
+            .collect(),
+    ))
+}
+
 pub(crate) async fn get_match(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -435,9 +490,12 @@ pub(crate) async fn get_player(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(account_id): Path<u32>,
+    Query(query): Query<PlayerQuery>,
 ) -> Result<Json<PlayerAverage>, (StatusCode, Json<ErrorBody>)> {
     authorize(&headers, &state.read_api)?;
-    let summary = query_player_average(&state.read_api, account_id, String::new()).await?;
+    let last_matches = validate_player_limit(query.last)?;
+    let summary =
+        query_player_average(&state.read_api, account_id, String::new(), last_matches).await?;
     Ok(Json(summary))
 }
 
@@ -445,6 +503,7 @@ pub(crate) async fn get_player_by_name(
     State(state): State<AppState>,
     headers: HeaderMap,
     Path(name): Path<String>,
+    Query(query): Query<PlayerQuery>,
 ) -> Result<Json<PlayerAverage>, (StatusCode, Json<ErrorBody>)> {
     authorize(&headers, &state.read_api)?;
     let Some((account_id, canonical_name)) = state
@@ -456,7 +515,9 @@ pub(crate) async fn get_player_by_name(
     else {
         return Err(api_error(StatusCode::NOT_FOUND, "player not found"));
     };
-    let summary = query_player_average(&state.read_api, account_id, canonical_name).await?;
+    let last_matches = validate_player_limit(query.last)?;
+    let summary =
+        query_player_average(&state.read_api, account_id, canonical_name, last_matches).await?;
     Ok(Json(summary))
 }
 
@@ -509,6 +570,16 @@ fn authorize(
 
 fn api_error(status: StatusCode, error: &'static str) -> (StatusCode, Json<ErrorBody>) {
     (status, Json(ErrorBody { error }))
+}
+
+fn validate_player_limit(last: Option<u32>) -> Result<Option<u32>, (StatusCode, Json<ErrorBody>)> {
+    if last.is_some_and(|limit| limit == 0 || limit > MAX_PLAYER_MATCHES) {
+        return Err(api_error(
+            StatusCode::BAD_REQUEST,
+            "invalid player match limit",
+        ));
+    }
+    Ok(last)
 }
 
 fn match_selector(identifier: &str) -> Result<String, (StatusCode, Json<ErrorBody>)> {
@@ -1036,10 +1107,15 @@ async fn query_player_average(
     state: &ReadApiState,
     account_id: u32,
     name: String,
+    last_matches: Option<u32>,
 ) -> Result<PlayerAverage, (StatusCode, Json<ErrorBody>)> {
+    let stats_filter = player_match_filter(&state.database, account_id, last_matches, "stats");
+    let players_filter = player_match_filter(&state.database, account_id, last_matches, "players");
     let sql = format!(
-        "SELECT count() AS matches, sum(kills) AS kills, sum(deaths) AS deaths, sum(assists) AS assists, sum(shots_hit) AS shots_hit, sum(shots_missed) AS shots_missed, sum(hero_hits) AS hero_hits, sum(hero_crits) AS hero_crits, sum(if(match_rows.winning_team = players.team, 1, 0)) AS wins FROM (SELECT match_id, player_slot, argMax(ifNull(kills, 0), snapshot_time_s) AS kills, argMax(ifNull(deaths, 0), snapshot_time_s) AS deaths, argMax(ifNull(assists, 0), snapshot_time_s) AS assists, argMax(ifNull(shots_hit, 0), snapshot_time_s) AS shots_hit, argMax(ifNull(shots_missed, 0), snapshot_time_s) AS shots_missed, argMax(ifNull(hero_bullets_hit, 0), snapshot_time_s) AS hero_hits, argMax(ifNull(hero_bullets_hit_crit, 0), snapshot_time_s) AS hero_crits FROM {db}.match_player_stats WHERE account_id = {account_id} GROUP BY match_id, player_slot) AS stats LEFT JOIN (SELECT match_id, player_slot, any(team) AS team FROM {db}.match_players WHERE account_id = {account_id} GROUP BY match_id, player_slot) AS players ON players.match_id = stats.match_id AND players.player_slot = stats.player_slot INNER JOIN {db}.matches AS match_rows ON match_rows.match_id = stats.match_id",
+        "SELECT count() AS matches, sum(kills) AS kills, sum(deaths) AS deaths, sum(assists) AS assists, sum(shots_hit) AS shots_hit, sum(shots_missed) AS shots_missed, sum(hero_hits) AS hero_hits, sum(hero_crits) AS hero_crits, avg(toFloat64(player_damage) * 60.0 / greatest(toFloat64(ifNull(match_rows.duration_s, 60)), 60.0)) AS damage_per_minute, sum(if(match_rows.winning_team = players.team, 1, 0)) AS wins FROM (SELECT stats.match_id, stats.player_slot, argMax(ifNull(stats.kills, 0), stats.snapshot_time_s) AS kills, argMax(ifNull(stats.deaths, 0), stats.snapshot_time_s) AS deaths, argMax(ifNull(stats.assists, 0), stats.snapshot_time_s) AS assists, argMax(ifNull(stats.shots_hit, 0), stats.snapshot_time_s) AS shots_hit, argMax(ifNull(stats.shots_missed, 0), stats.snapshot_time_s) AS shots_missed, argMax(ifNull(stats.hero_bullets_hit, 0), stats.snapshot_time_s) AS hero_hits, argMax(ifNull(stats.hero_bullets_hit_crit, 0), stats.snapshot_time_s) AS hero_crits, argMax(ifNull(stats.player_damage, 0), stats.snapshot_time_s) AS player_damage FROM {db}.match_player_stats AS stats WHERE stats.account_id = {account_id}{stats_filter} GROUP BY stats.match_id, stats.player_slot) AS stats LEFT JOIN (SELECT players.match_id, players.player_slot, any(players.team) AS team FROM {db}.match_players AS players WHERE players.account_id = {account_id}{players_filter} GROUP BY players.match_id, players.player_slot) AS players ON players.match_id = stats.match_id AND players.player_slot = stats.player_slot INNER JOIN {db}.matches AS match_rows ON match_rows.match_id = stats.match_id",
         db = state.database,
+        stats_filter = stats_filter,
+        players_filter = players_filter,
     );
     let rows = query_rows(state, &sql).await?;
     let Some(row) = rows.first() else {
@@ -1056,9 +1132,10 @@ async fn query_player_average(
     let shots_missed = number_f64(row, "shots_missed");
     let hero_hits = number_f64(row, "hero_hits");
     let hero_crits = number_f64(row, "hero_crits");
+    let damage_per_minute = number_f64(row, "damage_per_minute");
     let wins = number_f64(row, "wins");
-    let heroes = query_player_heroes(state, account_id).await?;
-    let recent = query_player_recent(state, account_id).await?;
+    let heroes = query_player_heroes(state, account_id, last_matches).await?;
+    let recent = query_player_recent(state, account_id, last_matches).await?;
     Ok(PlayerAverage {
         name,
         matches,
@@ -1067,6 +1144,7 @@ async fn query_player_average(
         accuracy: shots_hit / (shots_hit + shots_missed).max(1.0),
         crit_rate: hero_crits / hero_hits.max(1.0),
         win_rate: wins / matches as f64,
+        damage_per_minute,
         heroes,
         recent,
     })
@@ -1075,9 +1153,11 @@ async fn query_player_average(
 async fn query_player_heroes(
     state: &ReadApiState,
     account_id: u32,
+    last_matches: Option<u32>,
 ) -> Result<Vec<HeroAverage>, (StatusCode, Json<ErrorBody>)> {
+    let match_filter = player_match_filter(&state.database, account_id, last_matches, "p");
     let sql = format!(
-        "SELECT p.hero_id, h.name AS hero_name, count() AS matches FROM {db}.match_players AS p LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE p.account_id = {account_id} AND p.hero_id != 0 GROUP BY p.hero_id, h.name ORDER BY matches DESC, p.hero_id LIMIT 20",
+        "SELECT p.hero_id, h.name AS hero_name, count() AS matches FROM {db}.match_players AS p LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE p.account_id = {account_id} AND p.hero_id != 0{match_filter} GROUP BY p.hero_id, h.name ORDER BY matches DESC, p.hero_id LIMIT 20",
         db = state.database,
     );
     let rows = query_rows(state, &sql).await?;
@@ -1096,9 +1176,11 @@ async fn query_player_heroes(
 async fn query_player_recent(
     state: &ReadApiState,
     account_id: u32,
+    last_matches: Option<u32>,
 ) -> Result<Vec<RecentMatch>, (StatusCode, Json<ErrorBody>)> {
+    let match_filter = player_match_filter(&state.database, account_id, last_matches, "p");
     let sql = format!(
-        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m INNER JOIN {db}.match_players AS p ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE p.account_id = {account_id} ORDER BY m.start_time DESC, m.match_id DESC LIMIT 20",
+        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m INNER JOIN {db}.match_players AS p ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE p.account_id = {account_id}{match_filter} ORDER BY m.start_time DESC, m.match_id DESC LIMIT 20",
         db = state.database,
     );
     let rows = query_rows(state, &sql).await?;
@@ -1129,6 +1211,20 @@ async fn query_player_recent(
         .collect())
 }
 
+fn player_match_filter(
+    database: &str,
+    account_id: u32,
+    last_matches: Option<u32>,
+    alias: &str,
+) -> String {
+    let Some(last_matches) = last_matches else {
+        return String::new();
+    };
+    format!(
+        " AND {alias}.match_id IN (SELECT selected.match_id FROM {database}.matches AS selected INNER JOIN {database}.match_players AS selected_players ON selected_players.match_id = selected.match_id WHERE selected_players.account_id = {account_id} GROUP BY selected.match_id, selected.start_time ORDER BY selected.start_time DESC, selected.match_id DESC LIMIT {last_matches})"
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1138,6 +1234,16 @@ mod tests {
         assert!(is_public_id("37bb05cc-27d5-5ae8-8c28-129dd11cd85c"));
         assert!(!is_public_id("37bb05cc-27d5-5ae8-8c28-129dd11cd85"));
         assert!(!is_public_id("' OR 1=1 --"));
+    }
+
+    #[test]
+    fn bounds_player_match_windows_without_interpolating_user_input() {
+        assert!(validate_player_limit(Some(1)).is_ok());
+        assert!(validate_player_limit(Some(100)).is_ok());
+        assert!(validate_player_limit(Some(0)).is_err());
+        assert!(validate_player_limit(Some(101)).is_err());
+        assert_eq!(player_match_filter("singularity", 42, None, "p"), "");
+        assert!(player_match_filter("singularity", 42, Some(10), "p").contains("LIMIT 10"));
     }
 
     #[test]

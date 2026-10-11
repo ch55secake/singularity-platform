@@ -40,6 +40,15 @@
 | `SINGULARITY_ASSETS_BASE_URL` | `https://api.deadlock-api.com/v1/assets` | Public asset API base |
 | `SINGULARITY_ASSETS_STATE_PATH` | `data/assets-state.json` | Asset snapshot state |
 | `SINGULARITY_ASSETS_TIMEOUT_SECONDS` | `30` | Asset request timeout |
+| `SINGULARITY_DISCORD_TOKEN` | unset | Discord bot token |
+| `SINGULARITY_DISCORD_CHANNEL_ID` | unset | Channel for processed-match posts |
+| `SINGULARITY_DISCORD_GUILD_ID` | unset | Optional guild-scoped command registration |
+| `SINGULARITY_DISCORD_API_URL` | `http://127.0.0.1:8080/api` | Read API base URL |
+| `SINGULARITY_DISCORD_READ_TOKEN` | `SINGULARITY_READ_TOKEN` | Optional read API bearer token |
+| `SINGULARITY_DISCORD_WEB_URL` | `http://127.0.0.1` | Public web URL used in match links |
+| `SINGULARITY_DISCORD_POLL_SECONDS` | `60` | New-match polling interval |
+| `SINGULARITY_DISCORD_STATE_PATH` | `data/discord-state.json` | Cursor and private account links |
+| `SINGULARITY_DISCORD_TIMEOUT_SECONDS` | `15` | Read API request timeout |
 | `RUST_LOG` | `singularity_platform=info` | Logging filter |
 
 ## Collector credentials
@@ -82,8 +91,9 @@ under `SINGULARITY_METADATA_OUTPUT_DIR`. The state file records
 error code without storing the URL or salt. Failed downloads use exponential
 backoff, including 404 and 5xx responses.
 
-After a successful download, apply `schema/002_matches.sql` and run the
-parser against the ClickHouse HTTP endpoint:
+After a successful download, apply `schema/002_matches.sql` and
+`schema/005_match_events.sql`, then run the parser against the ClickHouse HTTP
+endpoint:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
@@ -150,11 +160,13 @@ aliases are used by the web application's same-origin reverse proxy:
 
 ```text
 GET /api/matches
+GET /api/events/matches?after_start_time=...&after_match_id=...
 GET /api/matches/{uuid}
 GET /api/matches/{uuid}/positions
 GET /api/matches/{uuid}/deaths
 GET /api/players/{account_id}
 GET /api/players/by-name/{name}
+GET /api/players/{account_id}?last=N
 ```
 
 Read access is LAN-only by deployment policy and has no authentication by
@@ -172,6 +184,32 @@ SINGULARITY_MEMBER_NAMES_JSON='{"12345678":"oscar"}' \
 Steam account IDs are used only for this server-side lookup and are not
 included in browser JSON responses. Hero, item, ability, and map names and
 images come from the versioned asset tables.
+
+## Discord bot
+
+Run the Discord bot as a separate long-lived process after the read API is
+available:
+
+```bash
+SINGULARITY_DISCORD_TOKEN='keep-this-out-of-source-control' \
+SINGULARITY_DISCORD_CHANNEL_ID='123456789012345678' \
+SINGULARITY_DISCORD_GUILD_ID='123456789012345678' \
+SINGULARITY_DISCORD_READ_TOKEN="$SINGULARITY_READ_TOKEN" \
+  singularity-platform discord-bot
+```
+
+The bot uses the platform read API only; it never connects to ClickHouse. It
+polls `/api/events/matches`, emitted by the metadata parser after a complete
+ClickHouse write, and stores a private cursor so each group match is posted
+once. Apply `schema/005_match_events.sql` before starting it. The first pass
+establishes the cursor without replaying old matches. Use guild-scoped
+registration during development; omit
+`SINGULARITY_DISCORD_GUILD_ID` for global command registration.
+
+Available commands are `/link`, `/last`, `/match`, `/stats`, and
+`/leaderboard`. `/link` accepts a numeric account ID or numeric Steam profile
+URL and stores the mapping in the mode-600 bot state file. The bot does not
+echo account IDs, and `/stats` supports an optional last-match window.
 
 ## Asset lookups
 

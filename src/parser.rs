@@ -2,7 +2,7 @@ use std::{
     collections::BTreeMap,
     env,
     path::{Path, PathBuf},
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 #[cfg(unix)]
@@ -37,6 +37,15 @@ struct MatchRow {
     match_mode: Option<i32>,
     average_badge_team0: Option<u32>,
     average_badge_team1: Option<u32>,
+    metadata_version: u64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct MatchProcessedEventRow {
+    match_id: u64,
+    public_id: String,
+    start_time: u32,
+    processed_at: u64,
     metadata_version: u64,
 }
 
@@ -277,6 +286,19 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 &parsed.position_rows,
             )
             .await?;
+        clickhouse
+            .insert(
+                "match_processed_events",
+                EVENT_COLUMNS,
+                &[MatchProcessedEventRow {
+                    match_id: parsed.match_row.match_id,
+                    public_id: parsed.match_row.public_id.clone(),
+                    start_time: parsed.match_row.start_time.unwrap_or_default(),
+                    processed_at: now_seconds(),
+                    metadata_version: parsed.match_row.metadata_version,
+                }],
+            )
+            .await?;
         state
             .processed
             .insert(job_id.to_string(), parsed.match_row.metadata_version);
@@ -296,6 +318,7 @@ const ITEM_COLUMNS: &str = "match_id, player_slot, game_time_s, item_id, upgrade
 const DAMAGE_COLUMNS: &str = "match_id, dealer_slot, target_slot, source_details_index, stat_type, source_name, sample_time_s, raw_cumulative_damage, cumulative_damage, metadata_version";
 const DEATH_COLUMNS: &str = "match_id, victim_slot, death_index, killer_slot, game_time_s, time_to_kill_s, victim_x, victim_y, victim_z, killer_x, killer_y, killer_z, death_duration_s, metadata_version";
 const POSITION_COLUMNS: &str = "match_id, player_slot, sample_index, time_s, x, y, health, combat_type, move_type, metadata_version";
+const EVENT_COLUMNS: &str = "match_id, public_id, start_time, processed_at, metadata_version";
 
 impl ClickHouseClient {
     fn from_env() -> Result<Self, std::io::Error> {
@@ -497,6 +520,13 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
         death_rows,
         position_rows,
     })
+}
+
+fn now_seconds() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs()
 }
 
 fn player_row(match_id: u64, player: &Players, metadata_version: u64) -> PlayerRow {

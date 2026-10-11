@@ -32,11 +32,14 @@ must not be used in production.
 The platform exposes the browser-facing read contract at `/api/matches`,
 `/api/matches/{uuid}`, `/api/matches/{uuid}/positions`,
 `/api/matches/{uuid}/deaths`, `/api/players/{account_id}`, and
-`/api/players/by-name/{name}`. Equivalent paths without the `/api` prefix are
-available for direct LAN clients. Reads use a
-separate optional `SINGULARITY_READ_TOKEN`; when it is unset, LAN-only network
-isolation is the authentication boundary. Read queries are issued only when a
-request arrives, so health and process startup do not require ClickHouse.
+`/api/players/by-name/{name}`. The private notification cursor is available at
+`/api/events/matches` with tuple pagination. Player endpoints accept an
+optional `?last=N` window for aggregate and recent-match statistics.
+Equivalent paths without the `/api` prefix are available for direct LAN
+clients. Reads use a separate optional `SINGULARITY_READ_TOKEN`; when it is
+unset, LAN-only network isolation is the authentication boundary. Read queries
+are issued only when a request arrives, so health and process startup do not
+require ClickHouse.
 
 Match IDs in browser links are UUIDs generated once by the parser and persisted
 in parser state. Numeric match IDs remain accepted for migration and direct
@@ -140,6 +143,14 @@ The `assets-sync` command snapshots the public heroes, items, modifiers, and
 map assets into the `schema/003_assets.sql` lookup tables. Snapshot hashes make
 repeated refreshes idempotent, and the map snapshot records the minimap URL and
 world bounds needed by position and death consumers.
+
+The metadata parser writes an idempotent `match_processed_events` row after a
+complete match write. The read API exposes those rows at
+`/api/events/matches`; the optional `discord-bot` process consumes only that
+endpoint. It keeps a private cursor, posts each new group-member match once,
+and exposes `/link`, `/last`, `/match`, `/stats`, and `/leaderboard` slash
+commands. Account links and notification cursors are stored in a mode-600
+local state file; Discord tokens remain environment-only.
 
 ## Processing stages
 
