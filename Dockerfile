@@ -4,6 +4,11 @@ WORKDIR /build
 RUN apt-get update \
     && apt-get install --yes --no-install-recommends libssl-dev pkg-config protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
+
+# prost-build needs the system protobuf definitions for imports such as
+# google/protobuf/descriptor.proto.
+ENV PROTOC_INCLUDE=/usr/include
+
 COPY Cargo.toml ./
 COPY Cargo.lock ./
 COPY src ./src
