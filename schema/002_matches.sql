@@ -235,18 +235,18 @@ INNER JOIN timeline_totals AS timeline
 
 CREATE VIEW IF NOT EXISTS singularity.match_deaths_with_players AS
 SELECT
-    deaths.*,
+    death_rows.*,
     victim.hero_id AS victim_hero_id,
     victim.team AS victim_team,
     killer.hero_id AS killer_hero_id,
     killer.team AS killer_team
-FROM singularity.match_deaths AS deaths
+FROM singularity.match_deaths AS death_rows
 LEFT JOIN singularity.match_players AS victim
-    ON victim.match_id = deaths.match_id
-    AND victim.player_slot = deaths.victim_slot
+    ON victim.match_id = death_rows.match_id
+    AND victim.player_slot = death_rows.victim_slot
 LEFT JOIN singularity.match_players AS killer
-    ON killer.match_id = deaths.match_id
-    AND killer.player_slot = deaths.killer_slot;
+    ON killer.match_id = death_rows.match_id
+    AND killer.player_slot = death_rows.killer_slot;
 
 CREATE VIEW IF NOT EXISTS singularity.match_death_count_reconciliation AS
 WITH death_counts AS

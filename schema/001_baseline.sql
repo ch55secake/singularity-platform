@@ -17,4 +17,5 @@ CREATE TABLE IF NOT EXISTS singularity.match_salts
 )
 ENGINE = ReplacingMergeTree(received_at)
 PARTITION BY toYYYYMM(received_at)
-ORDER BY (match_id, cluster_id, metadata_salt, replay_salt);
+ORDER BY (match_id, cluster_id, metadata_salt, replay_salt)
+SETTINGS allow_nullable_key = 1;
