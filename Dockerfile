@@ -2,7 +2,7 @@ FROM rust:1.88-bookworm AS builder
 
 WORKDIR /build
 RUN apt-get update \
-    && apt-get install --yes --no-install-recommends libssl-dev pkg-config protobuf-compiler \
+    && apt-get install --yes --no-install-recommends libprotobuf-dev libssl-dev pkg-config protobuf-compiler \
     && rm -rf /var/lib/apt/lists/*
 
 # prost-build needs the system protobuf definitions for imports such as
