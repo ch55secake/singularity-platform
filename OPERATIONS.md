@@ -211,6 +211,27 @@ Available commands are `/link`, `/last`, `/match`, `/stats`, and
 URL and stores the mapping in the mode-600 bot state file. The bot does not
 echo account IDs, and `/stats` supports an optional last-match window.
 
+### Live match posts
+
+While a linked player is in a live match, the bot posts both teams to the same
+channel, with the linked player's team first. Each line shows the player's
+hero, Steam name, rank, W-L and KDA over their last 20 matches, and their match
+count and win rate on that hero. Each match is posted once; the last 200 posted
+match IDs are kept in the bot state file as `live_posted`.
+
+Live data comes from the community Deadlock API's active-match feed, which
+mirrors the in-game watch tab. That tab only lists about the top 200 matches
+being played, so lower-rated or quieter matches may not appear.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SINGULARITY_DISCORD_LIVE_MATCHES` | `true` | Set `false` to turn live posts off |
+| `SINGULARITY_DISCORD_LIVE_POLL_SECONDS` | `120` | How often to check for live matches |
+| `SINGULARITY_DISCORD_DEADLOCK_API_URL` | `https://api.deadlock-api.com` | Community API used for live data |
+
+`cargo test -- --ignored live_scout_against_community_api --nocapture` builds
+a post from a match being played right now.
+
 ## Asset lookups
 
 Apply `schema/003_assets.sql`, then refresh the public hero, item, ability, and
