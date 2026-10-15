@@ -128,10 +128,13 @@ The `metadata-parser` command decodes the protobuf handoff with the pinned
 Deadlock `valveprotos` definitions and inserts match, player, and timeline rows
 into ClickHouse using JSONEachRow. It tracks processed job digests separately
 and uses the `schema/002_matches.sql` and `schema/006_objectives.sql`
-ReplacingMergeTree tables for idempotent re-parsing. Destroyed objectives and
-mid-boss claims are stored in `match_objectives`. Upgrading the parse-state file
-from version 1 clears its processed-file cursor once, so retained metadata is
-reparsed to backfill objective events while preserving public match UUIDs.
+ReplacingMergeTree tables for idempotent re-parsing. Before transforming or
+inserting a new job, it checks `match_processed_events` by numeric `match_id`;
+jobs for already-processed matches are recorded as duplicates and skipped. The
+one-time version-1 parse-state migration bypasses that check and records matches
+it has backfilled, so retained metadata is reparsed once to add objective events
+while preserving public match UUIDs. Destroyed objectives and mid-boss claims
+are stored in `match_objectives`.
 Timeline rows include the upstream aim, kill-type, damage,
 mitigation, healing, power, and health counters. The derived views expose
 accuracy, hero crit rate, mutually exclusive bullet/ability/melee kill shares,
