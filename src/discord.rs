@@ -30,7 +30,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::discord_live::LiveScout;
+use crate::discord_format::{Cell, Column, TEAM_COLOURS, Tone, table};
+use crate::discord_live::{LiveScout, TEAM_NAMES, live_heading};
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080/api";
 const DEFAULT_WEB_URL: &str = "http://127.0.0.1";
@@ -169,6 +170,9 @@ struct StateFile {
     links: BTreeMap<String, LinkedAccount>,
     #[serde(default)]
     live_posted: Vec<u64>,
+    /// (hero, name) of the friends in each live-posted match, for the summary.
+    #[serde(default)]
+    live_friends: BTreeMap<u64, Vec<(String, String)>>,
 }
 
 struct State {
@@ -193,6 +197,14 @@ struct Handler {
 enum Reply {
     Text(String),
     Embed(Box<CreateEmbed>),
+    Post(Post),
+}
+
+/// Message text plus embeds.
+#[derive(Debug, Clone)]
+struct Post {
+    content: String,
+    embeds: Vec<CreateEmbed>,
 }
 
 #[derive(Debug)]
@@ -528,7 +540,7 @@ impl Service {
             .first()
             .ok_or_else(|| ApiError("That player has no processed matches yet.".into()))?;
         let detail = self.api.get_match(&recent.uuid).await?;
-        Ok(Reply::Embed(Box::new(self.match_embed(&detail, &[]))))
+        Ok(Reply::Post(self.match_post(&detail, &[], &[])))
     }
 
     async fn handle_match(&self, options: &[ResolvedOption<'_>]) -> Result<Reply, ApiError> {
@@ -538,7 +550,7 @@ impl Service {
             ));
         };
         let detail = self.api.get_match(&identifier).await?;
-        Ok(Reply::Embed(Box::new(self.match_embed(&detail, &[]))))
+        Ok(Reply::Post(self.match_post(&detail, &[], &[])))
     }
 
     async fn handle_stats(
@@ -640,86 +652,16 @@ impl Service {
         }
     }
 
-    /// `played_by` lists the Discord users whose collectors reported the match.
-    fn match_embed(&self, detail: &ApiMatchDetail, played_by: &[u64]) -> CreateEmbed {
-        let group_players = detail
-            .players
-            .iter()
-            .filter(|player| player.member.is_some())
-            .collect::<Vec<_>>();
-        let result = if group_players
-            .iter()
-            .any(|player| player.team == detail.winning_team)
-        {
-            "Group win"
-        } else if group_players.is_empty() {
-            "Match complete"
-        } else {
-            "Group loss"
-        };
-        let played_by = if played_by.is_empty() {
-            String::new()
-        } else {
-            let users = played_by
-                .iter()
-                .map(|user| format!("<@{user}>"))
-                .collect::<Vec<_>>();
-            format!("Played by {}\n", users.join(", "))
-        };
-        let player_lines = detail
-            .players
-            .iter()
-            .map(|player| {
-                format!(
-                    "{} — {} K/D/A {}/{}/{}",
-                    player
-                        .member
-                        .as_ref()
-                        .map(|member| member.name.as_str())
-                        .unwrap_or(player.hero.name.as_str()),
-                    player.hero.name,
-                    player.kills,
-                    player.deaths,
-                    player.assists
-                )
-            })
-            .collect::<Vec<_>>();
-        let best_damage = detail
-            .players
-            .iter()
-            .max_by_key(|player| player.hero_damage);
-        let best_accuracy = detail
-            .players
-            .iter()
-            .filter(|player| player.aim.shots_hit + player.aim.shots_missed > 0)
-            .max_by(|left, right| accuracy(left).total_cmp(&accuracy(right)));
-        let mut embed = CreateEmbed::new()
-            .title(format!("{} — {}", result, detail.mode))
-            .description(format!(
-                "{played_by}{}\n[Open match in Singularity]({}/m/{})",
-                format_duration(detail.duration_s),
-                self.config.web_url.trim_end_matches('/'),
-                detail.uuid
-            ))
-            .field("Players", player_lines.join("\n"), false);
-        if let Some(player) = best_damage {
-            embed = embed.field(
-                "Top hero damage",
-                format!("{} — {}", player.hero.name, player.hero_damage),
-                true,
-            );
-        }
-        if let Some(player) = best_accuracy {
-            embed = embed.field(
-                "Best accuracy",
-                format!("{} — {:.1}%", player.hero.name, accuracy(player) * 100.0),
-                true,
-            );
-        }
-        embed.footer(serenity::all::CreateEmbedFooter::new(format!(
-            "Match {}",
-            detail.match_id
-        )))
+    /// The after-match post. `played_by` lists the Discord users whose
+    /// collectors reported the match; `friend_heroes` maps heroes to friends'
+    /// names from the live post.
+    fn match_post(
+        &self,
+        detail: &ApiMatchDetail,
+        played_by: &[u64],
+        friend_heroes: &[(String, String)],
+    ) -> Post {
+        match_post(detail, played_by, friend_heroes, &self.config.web_url)
     }
 
     fn stats_embed(&self, player: &ApiPlayerAverage, last: Option<u32>) -> CreateEmbed {
@@ -793,6 +735,9 @@ impl EventHandler for Handler {
         let response = match reply {
             Reply::Text(content) => EditInteractionResponse::new().content(content),
             Reply::Embed(embed) => EditInteractionResponse::new().embed(*embed),
+            Reply::Post(post) => EditInteractionResponse::new()
+                .content(post.content)
+                .embeds(post.embeds),
         };
         if let Err(error) = command.edit_response(&context.http, response).await {
             warn!(%error, "Discord interaction response failed");
@@ -877,9 +822,14 @@ impl Service {
             if !has_linked || posted || !self.live_in_flight.lock().await.insert(active.match_id) {
                 continue;
             }
-            let embed = live.scout(&active, &linked, &[]).await;
+            let names = Self::linked_names(&*self.state.lock().await);
+            let post = live.scout(&active, &linked, &names, &[]).await;
+            let message = CreateMessage::new()
+                .content(live_heading(&active, ""))
+                .embeds(post.embeds)
+                .allowed_mentions(CreateAllowedMentions::new());
             let sent = self
-                .service_send_message(&http, CreateMessage::new().embed(embed))
+                .service_send_message(&http, message)
                 .await
                 .map_err(|error| error.to_string());
             if sent.is_ok() {
@@ -898,6 +848,29 @@ impl Service {
             .iter()
             .filter_map(|(user_id, link)| Some((link.account_id, user_id.parse::<u64>().ok()?)))
             .collect()
+    }
+
+    fn linked_names(state: &State) -> HashMap<u32, String> {
+        state
+            .file
+            .links
+            .values()
+            .map(|link| (link.account_id, link.discord_name.clone()))
+            .collect()
+    }
+
+    /// Keeps the friends' heroes for the after-match summary.
+    async fn remember_live_friends(
+        &self,
+        match_id: u64,
+        friends: Vec<(String, String)>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = self.state.lock().await;
+        state.file.live_friends.insert(match_id, friends);
+        while state.file.live_friends.len() > LIVE_POSTED_LIMIT {
+            state.file.live_friends.pop_first();
+        }
+        state.save().await
     }
 
     async fn remember_live_post(&self, match_id: u64) -> Result<(), Box<dyn std::error::Error>> {
@@ -994,8 +967,16 @@ impl Service {
         };
         let edit = match active {
             Some(active) => {
-                let embed = live.scout(&active, &linked, &report.account_ids).await;
-                EditMessage::new().content("").embed(embed)
+                let names = Self::linked_names(&*self.state.lock().await);
+                let post = live
+                    .scout(&active, &linked, &names, &report.account_ids)
+                    .await;
+                self.remember_live_friends(report.match_id, post.friends)
+                    .await?;
+                EditMessage::new()
+                    .content(live_heading(&active, &players_text(&report, &linked)))
+                    .embeds(post.embeds)
+                    .allowed_mentions(CreateAllowedMentions::new())
             }
             None => EditMessage::new().content(format!(
                 "{}\nCouldn't read the lobby for this match.",
@@ -1081,7 +1062,17 @@ impl Service {
                     .collect::<Vec<_>>();
                 played_by.sort_unstable();
                 played_by.dedup();
-                let message = CreateMessage::new().embed(self.match_embed(&detail, &played_by));
+                let friends = state
+                    .file
+                    .live_friends
+                    .get(&event.match_id)
+                    .cloned()
+                    .unwrap_or_default();
+                let post = self.match_post(&detail, &played_by, &friends);
+                let message = CreateMessage::new()
+                    .content(post.content)
+                    .embeds(post.embeds)
+                    .allowed_mentions(CreateAllowedMentions::new());
                 self.service_send_message(&http, message).await?;
             }
             state.file.last_start_time = event.start_time;
@@ -1101,8 +1092,8 @@ impl Service {
     }
 }
 
-/// The first message for a reported match, before the teams are known.
-fn match_found_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String {
+/// " for @a, @b" naming the linked players who reported the match.
+fn players_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String {
     let mut players = report
         .account_ids
         .iter()
@@ -1111,15 +1102,188 @@ fn match_found_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String
         .collect::<Vec<_>>();
     players.sort();
     players.dedup();
-    let who = if players.is_empty() {
+    if players.is_empty() {
         String::new()
     } else {
         format!(" for {}", players.join(", "))
-    };
+    }
+}
+
+/// The first message for a reported match, before the teams are known.
+fn match_found_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String {
     format!(
-        "🔍 **Match found**{who} · match {} · scouting the lobby, teams appear here a few minutes in",
+        "🔍 **Match found**{} · match {} · scouting the lobby, teams appear here a few minutes in",
+        players_text(report, linked),
         report.match_id
     )
+}
+
+const SUMMARY_COLUMNS: [Column; 5] = [
+    Column {
+        heading: "Hero",
+        width: 11,
+        right: false,
+    },
+    Column {
+        heading: "Player",
+        width: 10,
+        right: false,
+    },
+    Column {
+        heading: "K/D/A",
+        width: 8,
+        right: true,
+    },
+    Column {
+        heading: "Dmg",
+        width: 6,
+        right: true,
+    },
+    Column {
+        heading: "Acc",
+        width: 4,
+        right: true,
+    },
+];
+
+/// The after-match post: result line, then one coloured table per team.
+fn match_post(
+    detail: &ApiMatchDetail,
+    played_by: &[u64],
+    friend_heroes: &[(String, String)],
+    web_url: &str,
+) -> Post {
+    let friend_of = |player: &ApiDetailPlayer| {
+        friend_heroes
+            .iter()
+            .find(|(hero, _)| *hero == player.hero.name)
+            .map(|(_, name)| name.clone())
+            .or_else(|| player.member.as_ref().map(|member| member.name.clone()))
+    };
+    let our_teams = detail
+        .players
+        .iter()
+        .filter(|player| friend_of(player).is_some())
+        .map(|player| player.team)
+        .collect::<Vec<_>>();
+    let result = if our_teams.is_empty() {
+        "🏁 **Match complete**"
+    } else if our_teams.contains(&detail.winning_team) {
+        "✅ **Win**"
+    } else {
+        "❌ **Loss**"
+    };
+    let played_by = if played_by.is_empty() {
+        String::new()
+    } else {
+        let users = played_by
+            .iter()
+            .map(|user| format!("<@{user}>"))
+            .collect::<Vec<_>>();
+        format!(" for {}", users.join(", "))
+    };
+    let content = format!(
+        "{result}{played_by} · {} · {} · [full match on Singularity](<{}/m/{}>)",
+        detail.mode,
+        format_duration(detail.duration_s),
+        web_url.trim_end_matches('/'),
+        detail.uuid
+    );
+
+    let top_damage = detail
+        .players
+        .iter()
+        .map(|player| player.hero_damage)
+        .max()
+        .unwrap_or_default();
+    let our_team = our_teams.first().copied();
+    let mut teams = vec![0, 1];
+    if our_team == Some(1) {
+        teams.reverse();
+    }
+    let embeds = teams
+        .into_iter()
+        .filter_map(|team| {
+            let players = detail
+                .players
+                .iter()
+                .filter(|player| player.team == team)
+                .collect::<Vec<_>>();
+            if players.is_empty() {
+                return None;
+            }
+            let rows = players
+                .iter()
+                .map(|player| summary_row(player, friend_of(player), top_damage))
+                .collect::<Vec<_>>();
+            let index = usize::try_from(team).unwrap_or_default().min(1);
+            let mut title = TEAM_NAMES[index].to_string();
+            if team == detail.winning_team {
+                title = format!("🏆 {title} · Victory");
+            }
+            Some(
+                CreateEmbed::new()
+                    .title(title)
+                    .colour(TEAM_COLOURS[index])
+                    .description(table(&SUMMARY_COLUMNS, &rows)),
+            )
+        })
+        .collect::<Vec<_>>();
+    let embeds = match embeds.split_last() {
+        Some((last, rest)) => {
+            let mut embeds = rest.to_vec();
+            embeds.push(
+                last.clone()
+                    .footer(serenity::all::CreateEmbedFooter::new(format!(
+                        "Match {} · Dmg: hero damage, top in yellow · Acc: shot accuracy",
+                        detail.match_id
+                    ))),
+            );
+            embeds
+        }
+        None => embeds,
+    };
+    Post { content, embeds }
+}
+
+fn summary_row(player: &ApiDetailPlayer, friend: Option<String>, top_damage: u32) -> Vec<Cell> {
+    let kda = f64::from(player.kills + player.assists) / f64::from(player.deaths.max(1));
+    let kda_tone = if kda >= 3.0 {
+        Tone::Good
+    } else if kda < 1.5 {
+        Tone::Bad
+    } else {
+        Tone::Middling
+    };
+    let shots = player.aim.shots_hit + player.aim.shots_missed;
+    let damage_tone = if player.hero_damage == top_damage && top_damage > 0 {
+        Tone::Highlight
+    } else {
+        Tone::Plain
+    };
+    vec![
+        Cell::plain(player.hero.name.as_str()),
+        friend.map_or_else(Cell::empty, |name| Cell::new(name, Tone::Friend)),
+        Cell::new(
+            format!("{}/{}/{}", player.kills, player.deaths, player.assists),
+            kda_tone,
+        ),
+        Cell::new(format_thousands(player.hero_damage), damage_tone),
+        if shots > 0 {
+            Cell::plain(format!("{:.0}%", accuracy(player) * 100.0))
+        } else {
+            Cell::new("-", Tone::Muted)
+        },
+    ]
+}
+
+/// 47104 -> "47.1k".
+fn format_thousands(value: u32) -> String {
+    if value >= 1000 {
+        format!("{:.1}k", f64::from(value) / 1000.0)
+    } else {
+        value.to_string()
+    }
 }
 
 fn command_definitions() -> Vec<CreateCommand> {
@@ -1306,6 +1470,7 @@ fn empty_state() -> StateFile {
         last_match_id: 0,
         links: BTreeMap::new(),
         live_posted: Vec::new(),
+        live_friends: BTreeMap::new(),
     }
 }
 
@@ -1344,6 +1509,76 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn detail_player(team: i32, hero: &str, damage: u32) -> ApiDetailPlayer {
+        ApiDetailPlayer {
+            team,
+            member: None,
+            hero: ApiHero { name: hero.into() },
+            kills: 8,
+            deaths: 2,
+            assists: 9,
+            hero_damage: damage,
+            aim: ApiAim {
+                shots_hit: 30,
+                shots_missed: 70,
+            },
+        }
+    }
+
+    #[test]
+    fn summary_puts_our_team_first_and_marks_the_result() {
+        let detail = ApiMatchDetail {
+            uuid: "abc".into(),
+            match_id: 7,
+            duration_s: 1910,
+            mode: "6v6".into(),
+            winning_team: 0,
+            players: vec![
+                detail_player(0, "Haze", 30_000),
+                detail_player(1, "Vyper", 47_104),
+                detail_player(1, "Bebop", 12_000),
+            ],
+        };
+        let friends = [("Vyper".to_string(), "hobnobs".to_string())];
+
+        let post = match_post(&detail, &[5], &friends, "http://rake/");
+
+        assert_eq!(
+            post.content,
+            "❌ **Loss** for <@5> · 6v6 · 31:50 · [full match on Singularity](<http://rake/m/abc>)"
+        );
+        let embeds = serde_json::to_value(&post.embeds).unwrap();
+        assert_eq!(embeds[0]["title"], "Sapphire Flame");
+        assert_eq!(embeds[1]["title"], "🏆 Amber Hand · Victory");
+        let ours = embeds[0]["description"].as_str().unwrap();
+        assert!(ours.contains("\u{1b}[1;36mhobnobs"));
+        assert!(ours.contains("\u{1b}[1;33m 47.1k"));
+        assert!(ours.contains("8/2/9"));
+        assert!(
+            embeds[1]["footer"]["text"]
+                .as_str()
+                .unwrap()
+                .starts_with("Match 7")
+        );
+    }
+
+    /// Prints the summary post for a saved `/api/matches/{id}` response.
+    #[test]
+    #[ignore = "needs SINGULARITY_PREVIEW_MATCH pointing at a match JSON file"]
+    fn summary_preview() {
+        let path = env::var("SINGULARITY_PREVIEW_MATCH").unwrap();
+        let detail: ApiMatchDetail = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+        let hero = detail.players[0].hero.name.clone();
+        let post = match_post(
+            &detail,
+            &[1],
+            &[(hero, "friend".into())],
+            "http://192.168.1.110",
+        );
+        let message = serde_json::json!({"content": post.content, "embeds": post.embeds});
+        println!("{message}");
+    }
 
     #[test]
     fn match_found_names_each_linked_player_once() {

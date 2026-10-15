@@ -3,6 +3,7 @@
 
 mod assets;
 mod discord;
+mod discord_format;
 mod discord_live;
 mod live;
 mod metadata;

@@ -20,6 +20,8 @@ use std::{
 use reqwest::Client as HttpClient;
 use serde::{Deserialize, de::DeserializeOwned};
 use serenity::all::{CreateEmbed, CreateEmbedFooter};
+
+use crate::discord_format::{Cell, Column, TEAM_COLOURS, Tone, rate_tone, table};
 use tokio::{
     sync::{Mutex, Semaphore},
     task::JoinSet,
@@ -30,8 +32,7 @@ const DEFAULT_LIVE_POLL_SECONDS: u64 = 120;
 const RECENT_MATCHES: usize = 20;
 const LOOKUP_CONCURRENCY: usize = 6;
 const NAMES_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-const FIELD_LIMIT: usize = 1024;
-const TEAM_NAMES: [&str; 2] = ["Amber Hand", "Sapphire Flame"];
+pub(crate) const TEAM_NAMES: [&str; 2] = ["Amber Hand", "Sapphire Flame"];
 /// Recent games per player searched for shared matches.
 const STACK_WINDOW: usize = 30;
 /// Same-team games two players must share to count as a stack.
@@ -162,12 +163,18 @@ struct HeroStat {
     wins: u32,
 }
 
-/// Everything shown on one player's line.
+/// The live post's embeds, plus (hero, name) for each friend in the match so
+/// the after-match summary can name them.
+pub(crate) struct LivePost {
+    pub(crate) embeds: Vec<CreateEmbed>,
+    pub(crate) friends: Vec<(String, String)>,
+}
+
+/// Everything shown on one player's row.
 #[derive(Debug, Clone, Default)]
 pub(crate) struct PlayerCard {
     pub(crate) name: String,
     pub(crate) hero: String,
-    pub(crate) discord_user: Option<u64>,
     pub(crate) friend: bool,
     pub(crate) rank: String,
     /// (games, wins) on the hero being played.
@@ -333,8 +340,9 @@ impl LiveScout {
         &self,
         live: &ActiveMatch,
         linked: &HashMap<u32, u64>,
+        friend_names: &HashMap<u32, String>,
         friends: &[u32],
-    ) -> CreateEmbed {
+    ) -> LivePost {
         let names = self.names().await;
         let is_friend =
             |account_id: u32| linked.contains_key(&account_id) || friends.contains(&account_id);
@@ -416,7 +424,7 @@ impl LiveScout {
             .collect::<Vec<_>>();
         let stacks = find_stacks(&teams, &histories);
 
-        let mut lines: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+        let mut cards: [Vec<PlayerCard>; 2] = [Vec::new(), Vec::new()];
         let mut friend_teams = [false, false];
         for player in &live.players {
             let Some(team) = player
@@ -431,8 +439,9 @@ impl LiveScout {
             friend_teams[team] |= friend;
             let hero_id = player.hero_id.unwrap_or_default();
             let card = PlayerCard {
-                name: profiles
+                name: friend_names
                     .get(&account_id)
+                    .or_else(|| profiles.get(&account_id))
                     .cloned()
                     .unwrap_or_else(|| "Unknown player".into()),
                 hero: names
@@ -440,7 +449,6 @@ impl LiveScout {
                     .get(&hero_id)
                     .cloned()
                     .unwrap_or_else(|| format!("Hero {hero_id}")),
-                discord_user: linked.get(&account_id).copied(),
                 friend,
                 rank: badges
                     .get(&account_id)
@@ -454,9 +462,18 @@ impl LiveScout {
                     .map(|history| summarize_history(history, hero_id)),
                 stack: stacks.get(&account_id).copied(),
             };
-            lines[team].push(player_line(&card));
+            cards[team].push(card);
         }
-        live_embed(live, &lines, friend_teams, !stacks.is_empty())
+        let friends = cards
+            .iter()
+            .flatten()
+            .filter(|card| card.friend)
+            .map(|card| (card.hero.clone(), card.name.clone()))
+            .collect();
+        LivePost {
+            embeds: live_embeds(&cards, friend_teams),
+            friends,
+        }
     }
 }
 
@@ -564,31 +581,59 @@ pub(crate) fn summarize_history(history: &[HistoryEntry], hero_id: u32) -> Summa
     }
 }
 
-pub(crate) fn escape_markdown(text: &str) -> String {
-    text.chars()
-        .flat_map(|character| {
-            let escape = matches!(character, '\\' | '*' | '_' | '~' | '`' | '|' | '>');
-            escape
-                .then_some('\\')
-                .into_iter()
-                .chain(std::iter::once(character))
-        })
-        .collect()
-}
+const LIVE_COLUMNS: [Column; 7] = [
+    Column {
+        heading: "Hero",
+        width: 11,
+        right: false,
+    },
+    Column {
+        heading: "Player",
+        width: 12,
+        right: false,
+    },
+    Column {
+        heading: "Rank",
+        width: 11,
+        right: false,
+    },
+    Column {
+        heading: "Gms",
+        width: 4,
+        right: true,
+    },
+    Column {
+        heading: "WR",
+        width: 4,
+        right: true,
+    },
+    Column {
+        heading: "L20",
+        width: 5,
+        right: true,
+    },
+    Column {
+        heading: "S",
+        width: 1,
+        right: false,
+    },
+];
 
-/// One player's line. Friends only get their hero and name; for everyone else
-/// the line shows rank, games and win rate on the hero, recent W-L, and a
-/// stack tag.
-pub(crate) fn player_line(card: &PlayerCard) -> String {
-    let who = card
-        .discord_user
-        .map(|user| format!("<@{user}>"))
-        .unwrap_or_else(|| escape_markdown(&card.name));
-    let mut line = format!("**{}** · {who}", card.hero);
+/// One player's row. Friends only get their hero and name; everyone else gets
+/// rank, games and win rate on the hero, recent W-L, and a stack letter.
+pub(crate) fn live_row(card: &PlayerCard) -> Vec<Cell> {
     if card.friend {
-        return line;
+        return vec![
+            Cell::plain(card.hero.as_str()),
+            Cell::new(card.name.as_str(), Tone::Friend),
+            Cell::new("friend", Tone::Friend),
+        ];
     }
-    line.push_str(&format!(" · {}", card.rank));
+    let rank = if card.rank == "Unranked" || card.rank == "Unknown rank" {
+        Cell::new("-", Tone::Muted)
+    } else {
+        Cell::plain(card.rank.as_str())
+    };
     // Whole-history hero stats when the API has them, else the match history.
     let hero_games = card.hero_games.or_else(|| {
         let summary = card.summary.as_ref()?;
@@ -596,34 +641,42 @@ pub(crate) fn player_line(card: &PlayerCard) -> String {
         let games = u32::try_from(summary.hero_matches).ok()?;
         Some((games, (rate * f64::from(games)).round() as u32))
     });
-    match hero_games {
-        Some((games, wins)) if games > 0 => line.push_str(&format!(
-            " · {games} {} on hero ({:.0}%)",
-            if games == 1 { "game" } else { "games" },
-            f64::from(wins) * 100.0 / f64::from(games)
-        )),
-        _ if card
-            .summary
-            .as_ref()
-            .is_some_and(|summary| summary.recent > 0) =>
-        {
-            line.push_str(" · first game on hero");
+    let (games, rate) = match hero_games {
+        Some((games, wins)) if games > 0 => {
+            let rate = f64::from(wins) / f64::from(games);
+            (
+                Cell::plain(games.to_string()),
+                Cell::new(format!("{:.0}%", rate * 100.0), rate_tone(rate, games)),
+            )
         }
-        _ => {}
-    }
-    match card.summary.as_ref().filter(|summary| summary.recent > 0) {
-        Some(summary) => line.push_str(&format!(
-            " · {}-{} last {}",
-            summary.wins,
-            summary.recent - summary.wins,
-            summary.recent
-        )),
-        None => line.push_str(" · no public match history"),
-    }
-    if let Some(stack) = card.stack {
-        line.push_str(&format!(" · 🔗 stack {stack}"));
-    }
-    line
+        _ => (
+            Cell::new("new", Tone::Highlight),
+            Cell::new("-", Tone::Muted),
+        ),
+    };
+    let recent = match card.summary.as_ref().filter(|summary| summary.recent > 0) {
+        Some(summary) => {
+            let rate = summary.wins as f64 / summary.recent as f64;
+            Cell::new(
+                format!("{}-{}", summary.wins, summary.recent - summary.wins),
+                rate_tone(rate, u32::try_from(summary.recent).unwrap_or(0)),
+            )
+        }
+        None => Cell::new("priv", Tone::Muted),
+    };
+    let stack = card
+        .stack
+        .map(|letter| Cell::new(letter.to_string(), Tone::Stack(letter)))
+        .unwrap_or_else(Cell::empty);
+    vec![
+        Cell::plain(card.hero.as_str()),
+        Cell::plain(card.name.as_str()),
+        rank,
+        games,
+        rate,
+        recent,
+        stack,
+    ]
 }
 
 fn index_hero_stats(stats: Vec<HeroStat>) -> HashMap<(u32, u32), (u32, u32)> {
@@ -706,11 +759,8 @@ pub(crate) fn find_stacks(
     stacks
 }
 
-/// Field name and value pairs, the linked players' team first.
-pub(crate) fn live_fields(
-    lines: &[Vec<String>; 2],
-    friend_teams: [bool; 2],
-) -> Vec<(String, String)> {
+/// Teams in display order with their headings, the friends' team first.
+pub(crate) fn team_headings(friend_teams: [bool; 2]) -> Vec<(usize, String)> {
     let one_side = friend_teams[0] != friend_teams[1];
     let order = if one_side && friend_teams[1] {
         [1, 0]
@@ -719,7 +769,6 @@ pub(crate) fn live_fields(
     };
     order
         .into_iter()
-        .filter(|team| !lines[*team].is_empty())
         .map(|team| {
             let name = if one_side {
                 let side = if friend_teams[team] {
@@ -727,24 +776,16 @@ pub(crate) fn live_fields(
                 } else {
                     "Enemy team"
                 };
-                format!("{side} — {}", TEAM_NAMES[team])
+                format!("{side} · {}", TEAM_NAMES[team])
             } else {
                 TEAM_NAMES[team].to_string()
             };
-            (name, truncate(&lines[team].join("\n"), FIELD_LIMIT))
+            (team, name)
         })
         .collect()
 }
 
-fn truncate(text: &str, limit: usize) -> String {
-    if text.chars().count() <= limit {
-        return text.to_string();
-    }
-    let mut out = text.chars().take(limit - 1).collect::<String>();
-    out.push('…');
-    out
-}
-
+/// "Ranked · Europe", or "Match" when the mode is unknown.
 pub(crate) fn live_title(live: &ActiveMatch) -> String {
     let mode = live.match_mode_parsed.as_deref().unwrap_or("Match");
     match live
@@ -764,37 +805,55 @@ pub(crate) fn live_title(live: &ActiveMatch) -> String {
                 })
                 .collect::<Vec<_>>()
                 .join(" ");
-            format!("Live: {mode} · {region}")
+            format!("{mode} · {region}")
         }
-        None => format!("Live: {mode}"),
+        None => mode.to_string(),
     }
 }
 
-fn live_embed(
-    live: &ActiveMatch,
-    lines: &[Vec<String>; 2],
-    friend_teams: [bool; 2],
-    has_stacks: bool,
-) -> CreateEmbed {
+/// The message text above the team tables.
+pub(crate) fn live_heading(live: &ActiveMatch, who: &str) -> String {
     let started = live
         .start_time
         .map(|time| format!(" · started <t:{time}:R>"))
         .unwrap_or_default();
-    let mut embed = CreateEmbed::new()
-        .title(live_title(live))
-        .description(format!("Match {}{started}", live.match_id))
-        .colour(0xE8A33A);
-    for (name, value) in live_fields(lines, friend_teams) {
-        embed = embed.field(name, value, false);
-    }
-    let stacks = if has_stacks {
-        " · 🔗 same letter = on the same team in 2+ of their last 30 games"
-    } else {
-        ""
-    };
-    embed.footer(CreateEmbedFooter::new(format!(
-        "Live data from the community-run Deadlock API{stacks}"
-    )))
+    format!(
+        "🔴 **Live {}**{who} · match {}{started}",
+        live_title(live),
+        live.match_id
+    )
+}
+
+/// One embed per team with its colour and a table of players.
+fn live_embeds(cards: &[Vec<PlayerCard>; 2], friend_teams: [bool; 2]) -> Vec<CreateEmbed> {
+    let has_stacks = cards.iter().flatten().any(|card| card.stack.is_some());
+    let headings = team_headings(friend_teams)
+        .into_iter()
+        .filter(|(team, _)| !cards[*team].is_empty())
+        .collect::<Vec<_>>();
+    let last = headings.len().saturating_sub(1);
+    headings
+        .into_iter()
+        .enumerate()
+        .map(|(index, (team, heading))| {
+            let rows = cards[team].iter().map(live_row).collect::<Vec<_>>();
+            let embed = CreateEmbed::new()
+                .title(heading)
+                .colour(TEAM_COLOURS[team])
+                .description(table(&LIVE_COLUMNS, &rows));
+            if index != last {
+                return embed;
+            }
+            let stacks = if has_stacks {
+                " · S: same letter = queuing together"
+            } else {
+                ""
+            };
+            embed.footer(CreateEmbedFooter::new(format!(
+                "Gms/WR: games and win rate on this hero · L20: last 20 games{stacks} · community Deadlock API"
+            )))
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -904,8 +963,12 @@ mod tests {
         assert!(!won(&no_result));
     }
 
+    fn texts(row: &[Cell]) -> Vec<&str> {
+        row.iter().map(|cell| cell.text.as_str()).collect()
+    }
+
     #[test]
-    fn player_line_shows_hero_games_form_and_stack() {
+    fn rows_show_hero_games_form_and_stack() {
         let summary = summarize_history(&[entry(true, 20, 5, 5, 5), entry(false, 20, 5, 5, 5)], 10);
         let card = PlayerCard {
             name: "J~".into(),
@@ -916,47 +979,45 @@ mod tests {
             stack: Some('A'),
             ..PlayerCard::default()
         };
+        let row = live_row(&card);
         assert_eq!(
-            player_line(&card),
-            "**Haze** · J\\~ · Oracle 1 · 34 games on hero (56%) · 1-1 last 2 · 🔗 stack A"
+            texts(&row),
+            ["Haze", "J~", "Oracle 1", "34", "56%", "1-1", "A"]
         );
+        assert_eq!(row[4].tone, Tone::Good);
+        assert_eq!(row[5].tone, Tone::Muted);
+        assert_eq!(row[6].tone, Tone::Stack('A'));
 
-        let new_hero = PlayerCard {
+        let new_hero = live_row(&PlayerCard {
             hero_games: None,
             stack: None,
+            rank: "Unranked".into(),
             ..card.clone()
-        };
-        assert_eq!(
-            player_line(&new_hero),
-            "**Haze** · J\\~ · Oracle 1 · first game on hero · 1-1 last 2"
-        );
+        });
+        assert_eq!(texts(&new_hero), ["Haze", "J~", "-", "new", "-", "1-1", ""]);
 
-        let private = PlayerCard {
-            name: "a_b".into(),
+        let private = live_row(&PlayerCard {
+            name: "a".into(),
+            hero: "Haze".into(),
             rank: "Unranked".into(),
             ..PlayerCard::default()
-        };
-        assert_eq!(
-            player_line(&PlayerCard {
-                hero: "Haze".into(),
-                ..private
-            }),
-            "**Haze** · a\\_b · Unranked · no public match history"
-        );
+        });
+        assert_eq!(texts(&private)[5], "priv");
     }
 
     #[test]
-    fn friends_get_a_short_line() {
+    fn friends_get_a_short_row() {
         let card = PlayerCard {
-            name: "max".into(),
+            name: "hobnobs".into(),
             hero: "Vyper".into(),
-            discord_user: Some(7),
             friend: true,
             rank: "Oracle 4".into(),
             hero_games: Some((50, 30)),
             ..PlayerCard::default()
         };
-        assert_eq!(player_line(&card), "**Vyper** · <@7>");
+        let row = live_row(&card);
+        assert_eq!(texts(&row), ["Vyper", "hobnobs", "friend"]);
+        assert_eq!(row[1].tone, Tone::Friend);
     }
 
     #[test]
@@ -992,13 +1053,11 @@ mod tests {
 
     #[test]
     fn friends_team_comes_first() {
-        let lines = [vec!["enemy".to_string()], vec!["friend".to_string()]];
+        let headings = team_headings([false, true]);
 
-        let fields = live_fields(&lines, [false, true]);
-
-        assert_eq!(fields[0].0, "Your team — Sapphire Flame");
-        assert_eq!(fields[1].0, "Enemy team — Amber Hand");
-        assert_eq!(live_fields(&lines, [true, true])[0].0, "Amber Hand");
+        assert_eq!(headings[0], (1, "Your team · Sapphire Flame".to_string()));
+        assert_eq!(headings[1], (0, "Enemy team · Amber Hand".to_string()));
+        assert_eq!(team_headings([true, true])[0].1, "Amber Hand");
     }
 
     #[test]
@@ -1009,7 +1068,7 @@ mod tests {
             ..Default::default()
         };
 
-        assert_eq!(live_title(&live), "Live: Ranked · South America");
+        assert_eq!(live_title(&live), "Ranked · South America");
     }
 
     #[test]
@@ -1035,16 +1094,25 @@ mod tests {
             .unwrap();
         let friend = all[0].players[3].account_id.unwrap();
         let matches = scout.active_matches(&[friend]).await.unwrap();
-        let embed = scout
-            .scout(&matches[0], &HashMap::from([(friend, 1)]), &[])
+        let post = scout
+            .scout(
+                &matches[0],
+                &HashMap::from([(friend, 1)]),
+                &HashMap::from([(friend, "friend".to_string())]),
+                &[],
+            )
             .await;
-        let embed = serde_json::to_value(embed).unwrap();
-        println!("{}", serde_json::to_string_pretty(&embed).unwrap());
+        let message = serde_json::json!({
+            "content": live_heading(&matches[0], " for <@1>"),
+            "embeds": post.embeds,
+        });
+        println!("{message}");
         assert!(
-            embed["fields"][0]["value"]
+            message["embeds"][0]["description"]
                 .as_str()
                 .unwrap()
-                .contains("<@1>")
+                .contains("friend")
         );
+        assert_eq!(post.friends.len(), 1);
     }
 }

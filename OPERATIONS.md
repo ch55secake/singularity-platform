@@ -222,7 +222,12 @@ echo account IDs, and `/stats` supports an optional last-match window.
 ### Live match posts
 
 While a linked player is in a live match, the bot posts both teams to the same
-channel, with the linked player's team first. Friends (linked players and the
+channel, with the linked player's team first: one embed per team in the team's
+colour, each holding an aligned table in an `ansi` code block (coloured on
+desktop, uncoloured but aligned on mobile). Win rates are green at 55% and up,
+red at 45% and below, grey on fewer than 3 games; stack letters have their own
+colours. The after-match summary uses the same layout with K/D/A, hero damage
+(top damage in yellow) and accuracy. Friends (linked players and the
 players whose collectors reported the match) get a short line with their hero.
 Everyone else gets their rank, games and win rate on their hero over their whole
 history (`/v1/players/hero-stats`), and W-L over their last 20 matches. A
