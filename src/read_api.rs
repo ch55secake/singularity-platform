@@ -323,8 +323,10 @@ impl ReadApiState {
         let mut request = self
             .client
             .post(url)
-            .query(&[("query", format!("{sql} FORMAT JSONEachRow"))])
-            .header("content-type", "text/plain");
+            // The SQL goes in the body: ClickHouse rejects a POST without a
+            // body (411 Length Required), and long queries stay out of the URL.
+            .header("content-type", "text/plain")
+            .body(format!("{sql} FORMAT JSONEachRow"));
         if let Some(user) = &self.user {
             request = request.basic_auth(user, self.password.as_deref());
         }
