@@ -59,8 +59,8 @@ singularity-platform metadata-worker
 It writes decompressed metadata handoff files and restart-safe job state under
 `data/` by default. No Steam login or Steam credentials are used.
 
-After applying `schema/002_matches.sql` and `schema/005_match_events.sql`, load
-those files into ClickHouse with:
+After applying `schema/002_matches.sql`, `schema/005_match_events.sql`, and
+`schema/006_objectives.sql`, load those files into ClickHouse with:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \

@@ -25,6 +25,7 @@ const DEFAULT_OUTPUT_DIR: &str = "data/metadata";
 const DEFAULT_PARSE_STATE: &str = "data/metadata-parse-state.json";
 const DEFAULT_CLICKHOUSE_DATABASE: &str = "singularity";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
+const PARSE_STATE_VERSION: u32 = 2;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct MatchRow {
@@ -181,6 +182,16 @@ struct PlayerPositionRow {
     metadata_version: u64,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct ObjectiveRow {
+    match_id: u64,
+    event_index: u32,
+    objective_id: u32,
+    team: i32,
+    game_time_s: u32,
+    metadata_version: u64,
+}
+
 #[derive(Debug)]
 struct ParsedMatch {
     match_row: MatchRow,
@@ -190,6 +201,7 @@ struct ParsedMatch {
     damage_rows: Vec<DamageRow>,
     death_rows: Vec<DeathRow>,
     position_rows: Vec<PlayerPositionRow>,
+    objective_rows: Vec<ObjectiveRow>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -288,6 +300,13 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             .await?;
         clickhouse
             .insert(
+                "match_objectives",
+                OBJECTIVE_COLUMNS,
+                &parsed.objective_rows,
+            )
+            .await?;
+        clickhouse
+            .insert(
                 "match_processed_events",
                 EVENT_COLUMNS,
                 &[MatchProcessedEventRow {
@@ -318,6 +337,8 @@ const ITEM_COLUMNS: &str = "match_id, player_slot, game_time_s, item_id, upgrade
 const DAMAGE_COLUMNS: &str = "match_id, dealer_slot, target_slot, source_details_index, stat_type, source_name, sample_time_s, raw_cumulative_damage, cumulative_damage, metadata_version";
 const DEATH_COLUMNS: &str = "match_id, victim_slot, death_index, killer_slot, game_time_s, time_to_kill_s, victim_x, victim_y, victim_z, killer_x, killer_y, killer_z, death_duration_s, metadata_version";
 const POSITION_COLUMNS: &str = "match_id, player_slot, sample_index, time_s, x, y, health, combat_type, move_type, metadata_version";
+const OBJECTIVE_COLUMNS: &str =
+    "match_id, event_index, objective_id, team, game_time_s, metadata_version";
 const EVENT_COLUMNS: &str = "match_id, public_id, start_time, processed_at, metadata_version";
 
 impl ClickHouseClient {
@@ -412,16 +433,20 @@ impl ParseState {
         #[cfg(unix)]
         fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
         let file: ParseStateFile = serde_json::from_slice(&contents)?;
-        if file.version != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unsupported parser state version",
-            )
-            .into());
-        }
+        let processed = match file.version {
+            1 => BTreeMap::new(),
+            PARSE_STATE_VERSION => file.processed,
+            _ => {
+                return Err(std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "unsupported parser state version",
+                )
+                .into());
+            }
+        };
         Ok(Self {
             path: path.to_path_buf(),
-            processed: file.processed,
+            processed,
             public_ids: file.public_ids,
         })
     }
@@ -435,7 +460,7 @@ impl ParseState {
             fs::create_dir_all(parent).await?;
         }
         let contents = serde_json::to_vec_pretty(&ParseStateFile {
-            version: 1,
+            version: PARSE_STATE_VERSION,
             processed: self.processed.clone(),
             public_ids: self.public_ids.clone(),
         })?;
@@ -496,6 +521,8 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
     let damage_rows = damage_rows(match_id, info.damage_matrix.as_ref(), metadata_version);
     let death_rows = death_rows(match_id, &info.players, metadata_version);
     let position_rows = position_rows(match_id, info.match_paths.as_ref(), metadata_version);
+    let objective_rows =
+        objective_rows(match_id, &info.objectives, &info.mid_boss, metadata_version);
     for player in info.players {
         player_rows.push(player_row(match_id, &player, metadata_version));
         item_rows.extend(
@@ -519,7 +546,71 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
         damage_rows,
         death_rows,
         position_rows,
+        objective_rows,
     })
+}
+
+fn objective_rows(
+    match_id: u64,
+    objectives: &[valveprotos::deadlock::c_msg_match_meta_data_contents::Objective],
+    mid_bosses: &[valveprotos::deadlock::c_msg_match_meta_data_contents::MidBoss],
+    metadata_version: u64,
+) -> Vec<ObjectiveRow> {
+    let mut rows = Vec::new();
+    for objective in objectives {
+        let Some(game_time_s) = objective.destroyed_time_s.filter(|time| *time > 0) else {
+            continue;
+        };
+        let Some((objective_id, team)) = objective_identity(objective) else {
+            continue;
+        };
+        rows.push(ObjectiveRow {
+            match_id,
+            event_index: rows.len() as u32,
+            objective_id,
+            team,
+            game_time_s,
+            metadata_version,
+        });
+    }
+    for boss in mid_bosses {
+        let Some(game_time_s) = boss.destroyed_time_s.filter(|time| *time > 0) else {
+            continue;
+        };
+        rows.push(ObjectiveRow {
+            match_id,
+            event_index: rows.len() as u32,
+            objective_id: 16,
+            team: boss.team_claimed.unwrap_or_default(),
+            game_time_s,
+            metadata_version,
+        });
+    }
+    rows.sort_by_key(|row| (row.game_time_s, row.event_index));
+    for (event_index, row) in rows.iter_mut().enumerate() {
+        row.event_index = event_index as u32;
+    }
+    rows
+}
+
+fn objective_identity(
+    objective: &valveprotos::deadlock::c_msg_match_meta_data_contents::Objective,
+) -> Option<(u32, i32)> {
+    let legacy = objective.legacy_objective_id;
+    let legacy_identity = match legacy {
+        Some(0..=15) => legacy.map(|objective_id| (objective_id as u32, 0)),
+        Some(16..=31) => legacy.map(|objective_id| ((objective_id - 16) as u32, 1)),
+        _ => None,
+    };
+    let objective_id = objective
+        .team_objective_id
+        .and_then(|objective_id| u32::try_from(objective_id).ok())
+        .or_else(|| legacy_identity.map(|(objective_id, _)| objective_id))?;
+    let team = objective
+        .team
+        .or_else(|| legacy_identity.map(|(_, team)| team))
+        .unwrap_or_default();
+    Some((objective_id, team))
 }
 
 fn now_seconds() -> u64 {
@@ -829,12 +920,56 @@ fn generate_public_id() -> Result<String, std::io::Error> {
 mod tests {
     use super::*;
     use valveprotos::deadlock::c_msg_match_meta_data_contents::{
-        Deaths, Items, MatchInfo, PlayerStats, Position,
+        Deaths, Items, MatchInfo, MidBoss, Objective, PlayerStats, Position,
     };
     use valveprotos::deadlock::c_msg_match_player_damage_matrix::{
         DamageDealer, DamageSource, DamageToPlayer, SourceDetails,
     };
     use valveprotos::deadlock::c_msg_match_player_paths_data::Path as PlayerPath;
+
+    #[tokio::test]
+    async fn upgrades_old_parse_state_to_backfill_new_metadata_events() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "singularity-parser-state-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let previous = ParseStateFile {
+            version: 1,
+            processed: BTreeMap::from([("processed-job".to_string(), 42)]),
+            public_ids: BTreeMap::from([(42, "public-match-id".to_string())]),
+        };
+        fs::write(&path, serde_json::to_vec(&previous).unwrap())
+            .await
+            .unwrap();
+
+        let state = ParseState::load(&path).await.unwrap();
+
+        assert!(state.processed.is_empty());
+        assert_eq!(
+            state.public_ids.get(&42).map(String::as_str),
+            Some("public-match-id")
+        );
+        state.save().await.unwrap();
+        let saved: ParseStateFile =
+            serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(saved.version, PARSE_STATE_VERSION);
+        assert!(saved.processed.is_empty());
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[test]
+    fn falls_back_to_legacy_team_objective_ids() {
+        let objective = Objective {
+            legacy_objective_id: Some(17),
+            ..Default::default()
+        };
+
+        assert_eq!(objective_identity(&objective), Some((1, 1)));
+    }
 
     #[test]
     fn decodes_match_players_and_timeline_rows() {
@@ -877,6 +1012,25 @@ mod tests {
                         source_name: vec!["ability_test".to_string()],
                     }),
                 }),
+                objectives: vec![
+                    Objective {
+                        team_objective_id: Some(1),
+                        team: Some(1),
+                        destroyed_time_s: Some(240),
+                        ..Default::default()
+                    },
+                    Objective {
+                        team_objective_id: Some(5),
+                        team: Some(0),
+                        destroyed_time_s: None,
+                        ..Default::default()
+                    },
+                ],
+                mid_boss: vec![MidBoss {
+                    team_claimed: Some(0),
+                    destroyed_time_s: Some(900),
+                    ..Default::default()
+                }],
                 winning_team: Some(2),
                 players: vec![Players {
                     account_id: Some(7),
@@ -962,6 +1116,13 @@ mod tests {
         assert_eq!(parsed.position_rows[1].y, Some(20.0));
         assert_eq!(parsed.position_rows[1].combat_type, Some(2));
         assert_eq!(parsed.position_rows[1].move_type, Some(3));
+        assert_eq!(parsed.objective_rows.len(), 2);
+        assert_eq!(parsed.objective_rows[0].objective_id, 1);
+        assert_eq!(parsed.objective_rows[0].team, 1);
+        assert_eq!(parsed.objective_rows[0].game_time_s, 240);
+        assert_eq!(parsed.objective_rows[1].objective_id, 16);
+        assert_eq!(parsed.objective_rows[1].team, 0);
+        assert_eq!(parsed.objective_rows[1].game_time_s, 900);
         assert_eq!(parsed.damage_rows.len(), 2);
         assert_eq!(parsed.damage_rows[1].source_name, "ability_test");
         assert_eq!(parsed.damage_rows[1].sample_time_s, 120);
