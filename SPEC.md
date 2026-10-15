@@ -30,6 +30,7 @@ must not be used in production.
 ### Read API
 
 The platform exposes the browser-facing read contract at `/api/matches`,
+`/api/sessions`,
 `/api/matches/{uuid}`, `/api/matches/{uuid}/positions`,
 `/api/matches/{uuid}/deaths`, `/api/players/{account_id}`, and
 `/api/players/by-name/{name}`. The private notification cursor is available at
@@ -50,6 +51,15 @@ from `SINGULARITY_MEMBER_NAMES_JSON`.
 The by-name player endpoint is restricted to those configured member names and
 returns aggregate form, favourite heroes, and recent match rows. It lets the
 browser link to a player page without exposing or accepting a Steam account ID.
+
+The sessions endpoint includes matches containing at least one configured
+member. Matches are grouped in chronological order; an inactivity gap of 90
+minutes or more between the end of one match and the start of the next begins a
+new session. Each session reports its tracked members, wins, losses, split
+matches, win rate, and impact rating. A match's impact is the mean impact score
+of its tracked members, and a session's impact is the mean of its match scores,
+so each match contributes equally regardless of how many tracked members were
+present. Sessions are returned newest first, with their matches oldest first.
 
 The match detail response includes the final player-stat snapshot, every stats
 timeline row, source-normalized damage, item/ability events, death events,

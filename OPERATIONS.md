@@ -161,11 +161,12 @@ ability upgrades from shop upgrades.
 ## Read API
 
 The platform serves the browser contract at both `/matches` and `/api/matches`
-(and the corresponding player, positions, and deaths paths). The `/api/`
-aliases are used by the web application's same-origin reverse proxy:
+(and the corresponding sessions, player, positions, and deaths paths). The
+`/api/` aliases are used by the web application's same-origin reverse proxy:
 
 ```text
 GET /api/matches
+GET /api/sessions
 GET /api/events/matches?after_start_time=...&after_match_id=...
 GET /api/matches/{uuid}
 GET /api/matches/{uuid}/positions
