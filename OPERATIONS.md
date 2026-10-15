@@ -268,14 +268,17 @@ kept for a day. `GET /live` needs the read token and returns the reported
 matches with their start and end times and reporting account IDs (default: the
 last six hours).
 
-After a reported match ends, or 45 minutes after it started if no end report
-arrives, the platform asks the community API for its salts
-(`/v1/matches/{match_id}/salts`) and appends them to the spool, so the match is
-processed without anyone opening it in the in-game match history. Matches the
-collectors already sent are skipped. The community API fetches unknown salts
-from Steam at 10 per 30 minutes per IP, so requests are spaced at least three
-minutes apart, back off per match from 3 to 15 minutes, honour `Retry-After`,
-and stop four hours after the first report.
+When `SINGULARITY_FETCH_SALTS` is enabled, one hour after a reported match ends
+the platform falls back to asking the community API for its salts
+(`/v1/matches/{match_id}/salts`) and appends them to the spool. This gives the
+local collector time to find the URLs in Steam's cache; it watches for
+filesystem changes and rescans the cache every five minutes.
+Without an end report, the platform assumes the match ended 45 minutes after it
+started, then waits the same one-hour grace period. Matches the collectors
+already sent are skipped. The community API fetches unknown salts from Steam at
+10 per 30 minutes per IP, so requests are spaced at least three minutes apart,
+back off per match from 3 to 15 minutes, honour `Retry-After`, and stop four
+hours after the first report.
 
 | Variable | Default | Purpose |
 |---|---|---|

@@ -37,8 +37,8 @@ const SALTS_COLLECTOR_ID: &str = "community-api";
 const RETENTION_SECONDS: u64 = 24 * 60 * 60;
 /// The default window for `GET /live`.
 const DEFAULT_LIST_SECONDS: u64 = 6 * 60 * 60;
-/// Wait this long after a match ends before asking for its salts.
-const AFTER_END_SECONDS: u64 = 60;
+/// Give the local Steam cache an hour to expose the match salts before falling back.
+const AFTER_END_SECONDS: u64 = 60 * 60;
 /// Without an end report, assume a match is over this long after it started.
 const ASSUMED_LENGTH_SECONDS: u64 = 45 * 60;
 /// Stop asking for a match's salts this long after it was first reported.
@@ -136,7 +136,7 @@ impl LiveMatch {
     fn salts_due_at(&self) -> u64 {
         let due = match self.ended_at {
             Some(ended) => ended + AFTER_END_SECONDS,
-            None => self.first_seen + ASSUMED_LENGTH_SECONDS,
+            None => self.first_seen + ASSUMED_LENGTH_SECONDS + AFTER_END_SECONDS,
         };
         due.max(self.next_attempt_at)
     }
@@ -515,16 +515,18 @@ mod tests {
             ..LiveMatch::default()
         };
         assert!(!live.wants_salts(1_500));
-        // No end report: assume the match is over after 45 minutes.
-        assert!(live.wants_salts(1_000 + ASSUMED_LENGTH_SECONDS));
+        // No end report: assume the match ends after 45 minutes, then wait an hour.
+        assert!(!live.wants_salts(1_000 + ASSUMED_LENGTH_SECONDS + 60 * 60 - 1));
+        assert!(live.wants_salts(1_000 + ASSUMED_LENGTH_SECONDS + 60 * 60));
 
         live.ended_at = Some(2_000);
         assert!(!live.wants_salts(2_030));
-        assert!(live.wants_salts(2_000 + AFTER_END_SECONDS));
+        assert!(!live.wants_salts(2_000 + 60 * 60 - 1));
+        assert!(live.wants_salts(2_000 + 60 * 60));
 
-        live.next_attempt_at = 3_000;
-        assert!(!live.wants_salts(2_500));
-        assert!(live.wants_salts(3_000));
+        live.next_attempt_at = 7_000;
+        assert!(!live.wants_salts(6_000));
+        assert!(live.wants_salts(7_000));
 
         assert!(!live.wants_salts(1_000 + GIVE_UP_SECONDS));
         live.salts_stored = true;
