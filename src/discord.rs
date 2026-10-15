@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     env,
     fmt::{self, Display},
     path::{Path, PathBuf},
@@ -16,7 +16,7 @@ use serenity::{
     all::{
         Command, CommandInteraction, CommandOptionType, CreateAllowedMentions, CreateCommand,
         CreateCommandOption, CreateEmbed, CreateMessage, EditInteractionResponse, EditMessage,
-        EventHandler, GatewayIntents, GuildId, Http, Interaction, Ready, ResolvedOption,
+        EventHandler, GatewayIntents, GuildId, Http, Interaction, MessageId, Ready, ResolvedOption,
         ResolvedValue, UserId,
     },
     async_trait,
@@ -179,6 +179,9 @@ struct StateFile {
     /// The live post for each reported match, deleted if the match is cancelled.
     #[serde(default)]
     live_messages: BTreeMap<u64, u64>,
+    /// Live posts still saying "match found", finished after a restart.
+    #[serde(default)]
+    live_unfilled: BTreeSet<u64>,
 }
 
 struct State {
@@ -912,7 +915,7 @@ impl Service {
             let deleted = self
                 .config
                 .channel_id
-                .delete_message(&http, serenity::all::MessageId::new(message_id))
+                .delete_message(&http, MessageId::new(message_id))
                 .await;
             match deleted {
                 Ok(()) => info!(
@@ -948,20 +951,26 @@ impl Service {
             };
             let fresh = report.ended_at.is_none()
                 && now.saturating_sub(started_at) < REPORTED_MAX_AGE_SECONDS;
-            let posted = self
-                .state
-                .lock()
-                .await
-                .file
-                .live_posted
-                .contains(&report.match_id);
-            if !fresh || posted || !self.live_in_flight.lock().await.insert(report.match_id) {
+            let (posted, unfilled) = {
+                let state = self.state.lock().await;
+                let unfilled = state
+                    .file
+                    .live_unfilled
+                    .contains(&report.match_id)
+                    .then(|| state.file.live_messages.get(&report.match_id).copied())
+                    .flatten();
+                (state.file.live_posted.contains(&report.match_id), unfilled)
+            };
+            if !fresh || (posted && unfilled.is_none()) {
+                continue;
+            }
+            if !self.live_in_flight.lock().await.insert(report.match_id) {
                 continue;
             }
             let service = Arc::clone(self);
             tokio::spawn(async move {
                 let match_id = report.match_id;
-                if let Err(error) = service.post_reported(report).await {
+                if let Err(error) = service.post_reported(report, unfilled).await {
                     warn!(match_id, %error, "Reported live match could not be posted");
                 }
                 service.live_in_flight.lock().await.remove(&match_id);
@@ -974,7 +983,12 @@ impl Service {
     /// Posts "match found" straight away, then fills the message in with both
     /// teams once the live broadcast opens (a few minutes into the match),
     /// falling back to the watch-tab feed.
-    async fn post_reported(&self, report: ApiLiveMatch) -> Result<(), Box<dyn std::error::Error>> {
+    /// `existing` is a "match found" post left unfinished by a restart.
+    async fn post_reported(
+        &self,
+        report: ApiLiveMatch,
+        existing: Option<u64>,
+    ) -> Result<(), Box<dyn std::error::Error>> {
         let Some(live) = self.live.as_ref() else {
             return Ok(());
         };
@@ -982,19 +996,26 @@ impl Service {
             return Ok(());
         };
         let linked = Self::linked_accounts(&*self.state.lock().await);
-        let mut message = self
-            .config
-            .channel_id
-            .send_message(
-                &http,
-                CreateMessage::new()
-                    .content(match_found_text(&report, &linked))
-                    .allowed_mentions(CreateAllowedMentions::new()),
-            )
-            .await?;
-        // Remember it now so a restart doesn't post the match twice.
-        self.remember_live_post(report.match_id).await?;
-        {
+        let message_id = if let Some(message_id) = existing {
+            info!(
+                match_id = report.match_id,
+                "Resuming an unfinished live post"
+            );
+            MessageId::new(message_id)
+        } else {
+            let message = self
+                .config
+                .channel_id
+                .send_message(
+                    &http,
+                    CreateMessage::new()
+                        .content(match_found_text(&report, &linked))
+                        .allowed_mentions(CreateAllowedMentions::new()),
+                )
+                .await?;
+            // Remember it now so a restart doesn't post the match twice, and
+            // so a restart can finish it.
+            self.remember_live_post(report.match_id).await?;
             let mut state = self.state.lock().await;
             state
                 .file
@@ -1003,9 +1024,11 @@ impl Service {
             while state.file.live_messages.len() > LIVE_POSTED_LIMIT {
                 state.file.live_messages.pop_first();
             }
+            state.file.live_unfilled.insert(report.match_id);
             state.save().await?;
-        }
-        info!(match_id = report.match_id, "Posted match found");
+            info!(match_id = report.match_id, "Posted match found");
+            message.id
+        };
 
         let mut lookup = live
             .broadcast_players(report.match_id, report.started_at)
@@ -1055,7 +1078,13 @@ impl Service {
                 match_found_text(&report, &linked)
             )),
         };
-        message.edit(&http, edit).await?;
+        self.config
+            .channel_id
+            .edit_message(&http, message_id, edit)
+            .await?;
+        let mut state = self.state.lock().await;
+        state.file.live_unfilled.remove(&report.match_id);
+        state.save().await?;
         info!(match_id = report.match_id, "Posted reported live match");
         Ok(())
     }
@@ -1565,6 +1594,7 @@ fn empty_state() -> StateFile {
         live_posted: Vec::new(),
         live_friends: BTreeMap::new(),
         live_messages: BTreeMap::new(),
+        live_unfilled: BTreeSet::new(),
     }
 }
 
