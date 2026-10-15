@@ -188,7 +188,8 @@ SINGULARITY_MEMBER_NAMES_JSON='{"12345678":"oscar"}' \
 ```
 
 Steam account IDs are used only for this server-side lookup and are not
-included in browser JSON responses. Hero, item, ability, and map names and
+included in browser JSON responses. The one exception is `GET /live` (below),
+which is deliberately outside `/api` so the web app's proxy never serves it. Hero, item, ability, and map names and
 images come from the versioned asset tables.
 
 ## Discord bot
@@ -225,9 +226,51 @@ hero, Steam name, rank, W-L and KDA over their last 20 matches, and their match
 count and win rate on that hero. Each match is posted once; the last 200 posted
 match IDs are kept in the bot state file as `live_posted`.
 
-Live data comes from the community Deadlock API's active-match feed, which
-mirrors the in-game watch tab. That tab only lists about the top 200 matches
-being played, so lower-rated or quieter matches may not appear.
+Live matches come from two places:
+
+- **Collector reports.** The collector follows the game's console log
+  (Deadlock launched with `-condebug`) and sends `POST /ingest/live` with the
+  match ID when a match starts and ends. The bot polls `GET /live` every 20
+  seconds and, for a match that started in the last 40 minutes, reads the
+  players from the match's live broadcast with the community API's
+  `/v1/matches/demo/live/query`. The broadcast usually appears a few minutes
+  into the match. That endpoint allows 6 lookups per hour per IP, so a match is
+  looked up once; if it fails the bot tries the watch-tab feed and then gives
+  up on that match.
+- **The watch-tab feed.** The community API's active-match feed mirrors the
+  in-game watch tab, which only lists about the top 200 matches being played.
+
+Every match a collector reported also gets the after-match summary, naming the
+linked Discord users who played it, even without configured members.
+
+### Collector match reports
+
+```text
+POST /ingest/live      {"match_id": 117420947, "event": "started", "account_id": 1003816066}
+GET  /live?since=<unix seconds>
+```
+
+`POST /ingest/live` takes the same collector tokens and rate limit as
+`/ingest/salts`; `event` is `started` or `ended`. Reports are appended to
+`live.jsonl` next to the salt spool (`SINGULARITY_LIVE_PATH` overrides it) and
+kept for a day. `GET /live` needs the read token and returns the reported
+matches with their start and end times and reporting account IDs (default: the
+last six hours).
+
+After a reported match ends, or 45 minutes after it started if no end report
+arrives, the platform asks the community API for its salts
+(`/v1/matches/{match_id}/salts`) and appends them to the spool, so the match is
+processed without anyone opening it in the in-game match history. Matches the
+collectors already sent are skipped. The community API fetches unknown salts
+from Steam at 10 per 30 minutes per IP, so requests are spaced at least three
+minutes apart, back off per match from 3 to 15 minutes, honour `Retry-After`,
+and stop four hours after the first report.
+
+| Variable | Default | Purpose |
+|---|---|---|
+| `SINGULARITY_FETCH_SALTS` | `true` | Set `false` to stop fetching salts for reported matches |
+| `SINGULARITY_DEADLOCK_API_URL` | `https://api.deadlock-api.com` | Community API used for salts |
+| `SINGULARITY_LIVE_PATH` | `<spool dir>/live.jsonl` | Report log |
 
 | Variable | Default | Purpose |
 |---|---|---|
