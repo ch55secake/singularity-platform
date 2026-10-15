@@ -189,6 +189,7 @@ struct ObjectiveEvent {
     t: u32,
     team: i32,
     kind: String,
+    position_key: Option<String>,
     position: Option<[f64; 2]>,
 }
 
@@ -209,7 +210,6 @@ pub(crate) struct Paths {
 struct MapData {
     radius: f64,
     image: String,
-    #[serde(skip)]
     objective_positions: BTreeMap<String, [f64; 2]>,
 }
 
@@ -1130,7 +1130,7 @@ async fn load_map(state: &ReadApiState) -> Result<MapData, (StatusCode, Json<Err
         });
     };
     let radius = number_f64(row, "radius");
-    let objective_positions = string_value(row, "payload_json")
+    let mut objective_positions: BTreeMap<String, [f64; 2]> = string_value(row, "payload_json")
         .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
         .and_then(|payload| payload.get("objective_positions").cloned())
         .and_then(|positions| positions.as_object().cloned())
@@ -1145,6 +1145,9 @@ async fn load_map(state: &ReadApiState) -> Result<MapData, (StatusCode, Json<Err
                 .collect()
         })
         .unwrap_or_default();
+    if radius > 0.0 {
+        objective_positions.insert("mid_boss".to_string(), [0.0, 0.0]);
+    }
     Ok(MapData {
         radius,
         image: string_value(row, "minimap_url").unwrap_or_default(),
@@ -1168,16 +1171,19 @@ async fn load_objectives(
             let objective_id = number_u32(&row, "objective_id")?;
             let team = number_i32(&row, "team")?;
             let kind = objective_kind(objective_id)?.to_string();
-            let position = if objective_id == 16 {
-                Some([0.0, 0.0])
+            let position_key = if objective_id == 16 {
+                Some("mid_boss".to_string())
             } else {
                 objective_position_key(objective_id, team)
-                    .and_then(|key| map.objective_positions.get(&key).copied())
             };
+            let position = position_key
+                .as_ref()
+                .and_then(|key| map.objective_positions.get(key).copied());
             Some(ObjectiveEvent {
                 t: number_u32(&row, "game_time_s")?,
                 team,
                 kind,
+                position_key,
                 position,
             })
         })
@@ -1627,17 +1633,42 @@ mod tests {
     }
 
     #[test]
-    fn keeps_map_asset_positions_internal_to_the_browser_response() {
+    fn exposes_map_asset_positions_for_objective_markers() {
         let map = MapData {
             radius: 10_752.0,
             image: "https://assets.example/map.png".to_string(),
-            objective_positions: BTreeMap::from([("team0_core".to_string(), [0.0, 0.0])]),
+            objective_positions: BTreeMap::from([
+                ("mid_boss".to_string(), [0.0, 0.0]),
+                ("team0_core".to_string(), [100.0, 200.0]),
+            ]),
         };
 
         let json = serde_json::to_value(map).unwrap();
 
         assert_eq!(json["radius"], 10_752.0);
-        assert!(json.get("objective_positions").is_none());
+        assert_eq!(
+            json["objective_positions"]["team0_core"],
+            serde_json::json!([100.0, 200.0])
+        );
+        assert_eq!(
+            json["objective_positions"]["mid_boss"],
+            serde_json::json!([0.0, 0.0])
+        );
+    }
+
+    #[test]
+    fn objective_events_include_the_map_position_key() {
+        let event = ObjectiveEvent {
+            t: 120,
+            team: 1,
+            kind: "guardian".to_string(),
+            position_key: Some("team1_tier1_1".to_string()),
+            position: Some([-6_236.0, 2_365.0]),
+        };
+
+        let json = serde_json::to_value(event).unwrap();
+
+        assert_eq!(json["position_key"], "team1_tier1_1");
     }
 
     #[test]
