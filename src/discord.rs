@@ -14,9 +14,10 @@ use reqwest::Client as HttpClient;
 use serde::{Deserialize, Serialize, de::DeserializeOwned};
 use serenity::{
     all::{
-        Command, CommandInteraction, CommandOptionType, CreateCommand, CreateCommandOption,
-        CreateEmbed, CreateMessage, EditInteractionResponse, EventHandler, GatewayIntents, GuildId,
-        Http, Interaction, Ready, ResolvedOption, ResolvedValue, UserId,
+        Command, CommandInteraction, CommandOptionType, CreateAllowedMentions, CreateCommand,
+        CreateCommandOption, CreateEmbed, CreateMessage, EditInteractionResponse, EditMessage,
+        EventHandler, GatewayIntents, GuildId, Http, Interaction, Ready, ResolvedOption,
+        ResolvedValue, UserId,
     },
     async_trait,
     client::{Client as DiscordClient, Context},
@@ -950,51 +951,60 @@ impl Service {
     }
 
     /// Reads the teams from the live broadcast, falling back to the watch-tab feed.
+    /// Posts "match found" straight away, then fills the message in with both
+    /// teams once the live broadcast opens (a few minutes into the match),
+    /// falling back to the watch-tab feed.
     async fn post_reported(&self, report: ApiLiveMatch) -> Result<(), Box<dyn std::error::Error>> {
         let Some(live) = self.live.as_ref() else {
             return Ok(());
         };
+        let Some(http) = self.http.lock().await.clone() else {
+            return Ok(());
+        };
+        let linked = Self::linked_accounts(&*self.state.lock().await);
+        let mut message = self
+            .config
+            .channel_id
+            .send_message(
+                &http,
+                CreateMessage::new()
+                    .content(match_found_text(&report, &linked))
+                    .allowed_mentions(CreateAllowedMentions::new()),
+            )
+            .await?;
+        // Remember it now so a restart doesn't post the match twice.
+        self.remember_live_post(report.match_id).await?;
+        info!(match_id = report.match_id, "Posted match found");
+
         let active = match live
             .broadcast_players(report.match_id, report.started_at)
             .await
         {
-            Ok(active) => active,
+            Ok(active) => Some(active),
             Err(error) => {
                 warn!(match_id = report.match_id, %error, "Live broadcast lookup failed; trying the watch-tab feed");
-                let feed = live
-                    .active_matches(&report.account_ids)
+                live.active_matches(&report.account_ids)
                     .await
-                    .map_err(|error| error.to_string())?;
-                let Some(active) = feed
-                    .into_iter()
-                    .find(|active| active.match_id == report.match_id)
-                else {
-                    // Don't try again: each broadcast lookup uses up the hourly limit.
-                    self.remember_live_post(report.match_id).await?;
-                    return Err(format!("teams unavailable: {error}").into());
-                };
-                active
+                    .ok()
+                    .and_then(|feed| {
+                        feed.into_iter()
+                            .find(|active| active.match_id == report.match_id)
+                    })
             }
         };
-        if self
-            .state
-            .lock()
-            .await
-            .file
-            .live_posted
-            .contains(&report.match_id)
-        {
-            return Ok(());
-        }
-        let linked = Self::linked_accounts(&*self.state.lock().await);
-        let embed = live.scout(&active, &linked, &report.account_ids).await;
-        let Some(http) = self.http.lock().await.clone() else {
-            return Ok(());
+        let edit = match active {
+            Some(active) => {
+                let embed = live.scout(&active, &linked, &report.account_ids).await;
+                EditMessage::new().content("").embed(embed)
+            }
+            None => EditMessage::new().content(format!(
+                "{}\nCouldn't read the lobby for this match.",
+                match_found_text(&report, &linked)
+            )),
         };
-        self.service_send_message(&http, CreateMessage::new().embed(embed))
-            .await?;
+        message.edit(&http, edit).await?;
         info!(match_id = report.match_id, "Posted reported live match");
-        self.remember_live_post(report.match_id).await
+        Ok(())
     }
 
     async fn poll_once(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -1089,6 +1099,27 @@ impl Service {
         self.config.channel_id.send_message(http, message).await?;
         Ok(())
     }
+}
+
+/// The first message for a reported match, before the teams are known.
+fn match_found_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String {
+    let mut players = report
+        .account_ids
+        .iter()
+        .filter_map(|account_id| linked.get(account_id))
+        .map(|user| format!("<@{user}>"))
+        .collect::<Vec<_>>();
+    players.sort();
+    players.dedup();
+    let who = if players.is_empty() {
+        String::new()
+    } else {
+        format!(" for {}", players.join(", "))
+    };
+    format!(
+        "🔍 **Match found**{who} · match {} · scouting the lobby, teams appear here a few minutes in",
+        report.match_id
+    )
 }
 
 fn command_definitions() -> Vec<CreateCommand> {
@@ -1313,6 +1344,21 @@ fn now_seconds() -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn match_found_names_each_linked_player_once() {
+        let report = ApiLiveMatch {
+            match_id: 42,
+            started_at: Some(1),
+            ended_at: None,
+            account_ids: vec![1, 2, 3],
+        };
+        let linked = HashMap::from([(1, 10), (3, 30)]);
+        assert_eq!(
+            match_found_text(&report, &linked),
+            "🔍 **Match found** for <@10>, <@30> · match 42 · scouting the lobby, teams appear here a few minutes in"
+        );
+    }
 
     #[test]
     fn parses_numeric_and_steam64_profile_ids() {
