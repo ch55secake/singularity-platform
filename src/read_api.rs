@@ -1140,7 +1140,8 @@ async fn load_map(state: &ReadApiState) -> Result<MapData, (StatusCode, Json<Err
                 .filter_map(|(name, position)| {
                     let left = position.get("left_relative")?.as_f64()?;
                     let top = position.get("top_relative")?.as_f64()?;
-                    Some((name, map_relative_to_world(left, top, radius)))
+                    let world_position = objective_position_to_world(&name, left, top, radius);
+                    Some((name, world_position))
                 })
                 .collect()
         })
@@ -1218,6 +1219,17 @@ fn objective_position_key(objective_id: u32, team: i32) -> Option<String> {
 
 fn map_relative_to_world(left: f64, top: f64, radius: f64) -> [f64; 2] {
     [(left * 2.0 - 1.0) * radius, (1.0 - top * 2.0) * radius]
+}
+
+fn objective_position_to_world(key: &str, left: f64, top: f64, radius: f64) -> [f64; 2] {
+    // The upstream map asset records CSS margins (top-left anchors), not marker
+    // centers. Regular objective icons are 10% square; Core markers are 30% x 8%.
+    let (width, height) = if key.ends_with("_core") {
+        (0.30, 0.08)
+    } else {
+        (0.10, 0.10)
+    };
+    map_relative_to_world(left + width / 2.0, top + height / 2.0, radius)
 }
 
 fn build_player(
@@ -1627,9 +1639,13 @@ mod tests {
         );
         assert_eq!(objective_position_key(16, 0), None);
         assert_eq!(objective_position_key(1, 2), None);
-        let position = map_relative_to_world(0.21, 0.39, 10_752.0);
-        assert!((position[0] + 6_236.16).abs() < 1e-9);
-        assert!((position[1] - 2_365.44).abs() < 1e-9);
+        let guardian = objective_position_to_world("team1_tier1_1", 0.21, 0.39, 10_752.0);
+        assert!((guardian[0] + 5_160.96).abs() < 1e-9);
+        assert!((guardian[1] - 1_290.24).abs() < 1e-9);
+
+        let core = objective_position_to_world("team0_core", 0.35, 0.93, 10_752.0);
+        assert!(core[0].abs() < 1e-9);
+        assert!((core[1] + 10_106.88).abs() < 1e-9);
     }
 
     #[test]

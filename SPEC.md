@@ -65,6 +65,8 @@ known. `position` is an `[x, y]` world-coordinate pair or `null` when the curren
 map assets do not provide a location for that objective. The `mid_boss` map marker
 uses the center of the map. `map.objective_positions` maps supported objective
 keys to world-coordinate `[x, y]` pairs for rendering standing objectives.
+These coordinates identify the marker centers; upstream CSS margins are
+top-left anchors and are adjusted for the marker dimensions before conversion.
 
 Match detail players include a versioned `impact` score with combat, economy,
 utility, and survival components, each in the `-5..+5` range. Version 1
