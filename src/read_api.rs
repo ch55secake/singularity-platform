@@ -23,6 +23,7 @@ const MAX_LIMIT: u32 = 100;
 const MAX_OFFSET: u32 = 10_000;
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 const MAX_PLAYER_MATCHES: u32 = 100;
+const IMPACT_SCORE_VERSION: u32 = 1;
 
 #[derive(Clone)]
 pub(crate) struct ReadApiState {
@@ -111,6 +112,15 @@ struct KillTypes {
     headshot: u32,
 }
 
+#[derive(Debug, Serialize, Clone, Copy, Default)]
+struct ImpactScore {
+    score: f64,
+    combat: f64,
+    economy: f64,
+    utility: f64,
+    survival: f64,
+}
+
 #[derive(Debug, Serialize, Clone, Default)]
 struct Timeline {
     t: Vec<u32>,
@@ -156,6 +166,7 @@ struct Player {
     healing: u32,
     damage_taken: u32,
     damage_mitigated: u32,
+    impact: ImpactScore,
     aim: Aim,
     kill_types: KillTypes,
     timeline: Timeline,
@@ -200,6 +211,7 @@ pub(crate) struct MatchDetail {
     duration_s: u32,
     mode: String,
     winning_team: i32,
+    impact_score_version: u32,
     average_badge: [Option<u32>; 2],
     players: Vec<Player>,
     deaths: Vec<Death>,
@@ -217,6 +229,9 @@ pub(crate) struct PlayerAverage {
     crit_rate: f64,
     win_rate: f64,
     damage_per_minute: f64,
+    average_impact_score: f64,
+    impact_score_matches: u64,
+    impact_score_version: u32,
     heroes: Vec<HeroAverage>,
     recent: Vec<RecentMatch>,
 }
@@ -241,6 +256,7 @@ struct RecentMatch {
     kills: u32,
     deaths: u32,
     assists: u32,
+    impact_score: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -465,7 +481,7 @@ pub(crate) async fn get_match(
     let deaths = load_deaths(&state.read_api, core.match_id).await?;
     let paths = load_paths(&state.read_api, core.match_id).await?;
     let map = load_map(&state.read_api).await?;
-    let players = core
+    let mut players: Vec<Player> = core
         .players
         .iter()
         .map(|player| {
@@ -479,6 +495,16 @@ pub(crate) async fn get_match(
             )
         })
         .collect();
+    let impact_metrics = players
+        .iter()
+        .map(impact_metrics_from_player)
+        .collect::<Vec<_>>();
+    let impact_scores = calculate_impact_scores(core.duration_s, &impact_metrics);
+    for player in &mut players {
+        if let Some(impact) = impact_scores.get(&player.slot) {
+            player.impact = *impact;
+        }
+    }
     Ok(Json(MatchDetail {
         uuid: core.uuid,
         match_id: core.match_id,
@@ -486,6 +512,7 @@ pub(crate) async fn get_match(
         duration_s: core.duration_s,
         mode: mode_name(core.players.len()),
         winning_team: core.winning_team,
+        impact_score_version: IMPACT_SCORE_VERSION,
         average_badge: core.average_badge,
         players,
         deaths,
@@ -1119,6 +1146,7 @@ fn build_player(
         healing: stats.healing,
         damage_taken: stats.damage_taken,
         damage_mitigated: stats.damage_mitigated,
+        impact: ImpactScore::default(),
         aim: Aim {
             shots_hit: stats.shots_hit,
             shots_missed: stats.shots_missed,
@@ -1135,6 +1163,179 @@ fn build_player(
         damage_by_source: damage.get(&player.slot).cloned().unwrap_or_default(),
         build: builds.get(&player.slot).cloned().unwrap_or_default(),
     }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ImpactMetrics {
+    slot: u32,
+    hero_damage: f64,
+    kills: f64,
+    deaths: f64,
+    assists: f64,
+    souls: f64,
+    last_hits: f64,
+    denies: f64,
+    healing: f64,
+    damage_mitigated: f64,
+}
+
+fn impact_metrics_from_player(player: &Player) -> ImpactMetrics {
+    ImpactMetrics {
+        slot: player.slot,
+        hero_damage: f64::from(player.hero_damage),
+        kills: f64::from(player.kills),
+        deaths: f64::from(player.deaths),
+        assists: f64::from(player.assists),
+        souls: f64::from(player.souls),
+        last_hits: f64::from(player.last_hits),
+        denies: f64::from(player.denies),
+        healing: f64::from(player.healing),
+        damage_mitigated: f64::from(player.damage_mitigated),
+    }
+}
+
+fn calculate_impact_scores(
+    duration_s: u32,
+    players: &[ImpactMetrics],
+) -> HashMap<u32, ImpactScore> {
+    if players.is_empty() {
+        return HashMap::new();
+    }
+
+    let minutes = f64::from(duration_s.max(60)) / 60.0;
+    let rates = players
+        .iter()
+        .map(|player| {
+            [
+                player.hero_damage / minutes,
+                (player.kills + player.assists) / minutes,
+                player.souls / minutes,
+                (player.last_hits + player.denies) / minutes,
+                player.healing / minutes + player.damage_mitigated / minutes,
+                player.deaths / minutes,
+            ]
+        })
+        .collect::<Vec<_>>();
+    let z_scores = (0..6)
+        .map(|metric| standard_scores(&rates.iter().map(|row| row[metric]).collect::<Vec<_>>()))
+        .collect::<Vec<_>>();
+
+    players
+        .iter()
+        .enumerate()
+        .map(|(index, player)| {
+            let combat = component_score((z_scores[0][index] + z_scores[1][index]) / 2.0);
+            let economy = component_score((z_scores[2][index] + z_scores[3][index]) / 2.0);
+            let utility = component_score(z_scores[4][index]);
+            let survival = component_score(-z_scores[5][index]);
+            let score =
+                round_score(combat * 0.40 + economy * 0.25 + utility * 0.20 + survival * 0.15);
+            (
+                player.slot,
+                ImpactScore {
+                    score,
+                    combat,
+                    economy,
+                    utility,
+                    survival,
+                },
+            )
+        })
+        .collect()
+}
+
+fn standard_scores(values: &[f64]) -> Vec<f64> {
+    if values.len() < 2 {
+        return vec![0.0; values.len()];
+    }
+    let mean = values.iter().sum::<f64>() / values.len() as f64;
+    let deviation = (values
+        .iter()
+        .map(|value| (value - mean).powi(2))
+        .sum::<f64>()
+        / values.len() as f64)
+        .sqrt();
+    if deviation <= f64::EPSILON {
+        return vec![0.0; values.len()];
+    }
+    values
+        .iter()
+        .map(|value| ((value - mean) / deviation).clamp(-2.5, 2.5))
+        .collect()
+}
+
+fn component_score(value: f64) -> f64 {
+    round_score(value.clamp(-2.5, 2.5) * 2.0)
+}
+
+fn round_score(value: f64) -> f64 {
+    (value.clamp(-5.0, 5.0) * 100.0).round() / 100.0
+}
+
+async fn query_player_impact_scores(
+    state: &ReadApiState,
+    account_id: u32,
+    last_matches: Option<u32>,
+) -> Result<BTreeMap<u64, f64>, (StatusCode, Json<ErrorBody>)> {
+    let limit = last_matches
+        .map(|count| format!("LIMIT {count}"))
+        .unwrap_or_default();
+    let sql = format!(
+        "WITH target_matches AS (SELECT match_rows.match_id, match_rows.start_time, match_rows.duration_s FROM {db}.matches AS match_rows INNER JOIN {db}.match_players AS target ON target.match_id = match_rows.match_id WHERE target.account_id = {account_id} GROUP BY match_rows.match_id, match_rows.start_time, match_rows.duration_s ORDER BY match_rows.start_time DESC, match_rows.match_id DESC {limit}), latest_stats AS (SELECT stats.match_id, stats.player_slot, argMax(ifNull(stats.player_damage, 0), stats.snapshot_time_s) AS hero_damage, argMax(ifNull(stats.player_healing, 0), stats.snapshot_time_s) AS healing, argMax(ifNull(stats.damage_mitigated, 0), stats.snapshot_time_s) AS damage_mitigated FROM {db}.match_player_stats AS stats WHERE stats.match_id IN (SELECT match_id FROM target_matches) GROUP BY stats.match_id, stats.player_slot) SELECT target_matches.match_id, target_matches.duration_s, players.account_id, players.player_slot, players.kills, players.deaths, players.assists, players.net_worth AS souls, players.last_hits, players.denies, ifNull(latest_stats.hero_damage, 0) AS hero_damage, ifNull(latest_stats.healing, 0) AS healing, ifNull(latest_stats.damage_mitigated, 0) AS damage_mitigated FROM target_matches INNER JOIN {db}.match_players AS players ON players.match_id = target_matches.match_id LEFT JOIN latest_stats ON latest_stats.match_id = players.match_id AND latest_stats.player_slot = players.player_slot ORDER BY target_matches.start_time DESC, target_matches.match_id DESC, players.player_slot",
+        db = state.database,
+    );
+    let rows = query_rows(state, &sql).await?;
+    let mut grouped: BTreeMap<u64, (u32, Vec<ImpactMetrics>, Vec<u32>)> = BTreeMap::new();
+    for row in rows {
+        let (Some(match_id), Some(slot)) = (
+            number_u64(&row, "match_id"),
+            number_u32(&row, "player_slot"),
+        ) else {
+            continue;
+        };
+        let account = number_u32(&row, "account_id").unwrap_or_default();
+        let entry = grouped.entry(match_id).or_insert_with(|| {
+            (
+                number_u32(&row, "duration_s").unwrap_or_default(),
+                Vec::new(),
+                Vec::new(),
+            )
+        });
+        entry.1.push(ImpactMetrics {
+            slot,
+            hero_damage: number_f64(&row, "hero_damage"),
+            kills: f64::from(number_u32(&row, "kills").unwrap_or_default()),
+            deaths: f64::from(number_u32(&row, "deaths").unwrap_or_default()),
+            assists: f64::from(number_u32(&row, "assists").unwrap_or_default()),
+            souls: number_f64(&row, "souls"),
+            last_hits: number_f64(&row, "last_hits"),
+            denies: number_f64(&row, "denies"),
+            healing: number_f64(&row, "healing"),
+            damage_mitigated: number_f64(&row, "damage_mitigated"),
+        });
+        if account == account_id {
+            entry.2.push(slot);
+        }
+    }
+
+    let mut scores = BTreeMap::new();
+    for (match_id, (duration_s, players, target_slots)) in grouped {
+        if target_slots.is_empty() {
+            continue;
+        }
+        let match_scores = calculate_impact_scores(duration_s, &players);
+        let target_scores = target_slots
+            .iter()
+            .filter_map(|slot| match_scores.get(slot).map(|score| score.score))
+            .collect::<Vec<_>>();
+        if !target_scores.is_empty() {
+            scores.insert(
+                match_id,
+                round_score(target_scores.iter().sum::<f64>() / target_scores.len() as f64),
+            );
+        }
+    }
+    Ok(scores)
 }
 
 async fn query_player_average(
@@ -1169,7 +1370,19 @@ async fn query_player_average(
     let damage_per_minute = number_f64(row, "damage_per_minute");
     let wins = number_f64(row, "wins");
     let heroes = query_player_heroes(state, account_id, last_matches).await?;
-    let recent = query_player_recent(state, account_id, last_matches).await?;
+    let impact_scores = query_player_impact_scores(state, account_id, last_matches).await?;
+    let average_impact_score = if impact_scores.is_empty() {
+        0.0
+    } else {
+        round_score(impact_scores.values().sum::<f64>() / impact_scores.len() as f64)
+    };
+    let mut recent = query_player_recent(state, account_id, last_matches).await?;
+    for match_data in &mut recent {
+        match_data.impact_score = impact_scores
+            .get(&match_data.match_id)
+            .copied()
+            .unwrap_or_default();
+    }
     Ok(PlayerAverage {
         name,
         matches,
@@ -1179,6 +1392,9 @@ async fn query_player_average(
         crit_rate: hero_crits / hero_hits.max(1.0),
         win_rate: wins / matches as f64,
         damage_per_minute,
+        average_impact_score,
+        impact_score_matches: impact_scores.len() as u64,
+        impact_score_version: IMPACT_SCORE_VERSION,
         heroes,
         recent,
     })
@@ -1241,6 +1457,7 @@ async fn query_player_recent(
                 kills: number_u32(&row, "kills").unwrap_or_default(),
                 deaths: number_u32(&row, "deaths").unwrap_or_default(),
                 assists: number_u32(&row, "assists").unwrap_or_default(),
+                impact_score: 0.0,
             })
         })
         .collect())
@@ -1292,6 +1509,85 @@ mod tests {
         let json = serde_json::to_value(hero).unwrap();
 
         assert_eq!(json["icon"], "https://assets.example/billy.webp");
+    }
+
+    #[test]
+    fn impact_scores_are_neutral_for_identical_lobby_stats() {
+        let baseline = ImpactMetrics {
+            slot: 1,
+            hero_damage: 1000.0,
+            kills: 2.0,
+            deaths: 2.0,
+            assists: 4.0,
+            souls: 12000.0,
+            last_hits: 80.0,
+            denies: 4.0,
+            healing: 100.0,
+            damage_mitigated: 200.0,
+        };
+        let players = [
+            baseline,
+            ImpactMetrics {
+                slot: 2,
+                ..baseline
+            },
+        ];
+
+        let scores = calculate_impact_scores(600, &players);
+
+        assert_eq!(scores[&1].score, 0.0);
+        assert_eq!(scores[&2].score, 0.0);
+    }
+
+    #[test]
+    fn impact_score_rewards_broad_contribution_and_stays_bounded() {
+        let baseline = ImpactMetrics {
+            slot: 1,
+            hero_damage: 1000.0,
+            kills: 2.0,
+            deaths: 2.0,
+            assists: 4.0,
+            souls: 12000.0,
+            last_hits: 80.0,
+            denies: 4.0,
+            healing: 100.0,
+            damage_mitigated: 200.0,
+        };
+        let standout = ImpactMetrics {
+            slot: 3,
+            hero_damage: 6000.0,
+            kills: 9.0,
+            deaths: 1.0,
+            assists: 12.0,
+            souls: 25000.0,
+            last_hits: 170.0,
+            denies: 12.0,
+            healing: 1600.0,
+            damage_mitigated: 1800.0,
+        };
+
+        let scores = calculate_impact_scores(
+            1200,
+            &[
+                baseline,
+                ImpactMetrics {
+                    slot: 2,
+                    ..baseline
+                },
+                standout,
+            ],
+        );
+        let strong = scores[&3];
+
+        assert!(strong.score > 0.0);
+        assert!(scores[&1].score < 0.0);
+        for score in scores.values() {
+            assert!((-5.0..=5.0).contains(&score.score));
+            assert!((-5.0..=5.0).contains(&score.combat));
+            assert!((-5.0..=5.0).contains(&score.economy));
+            assert!((-5.0..=5.0).contains(&score.utility));
+            assert!((-5.0..=5.0).contains(&score.survival));
+        }
     }
 
     #[test]

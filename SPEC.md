@@ -57,6 +57,22 @@ world-coordinate paths, and the current map asset. Missing optional metadata is
 represented by nulls or empty arrays. A healthy service returns `503` for read
 requests when ClickHouse is unavailable.
 
+Match detail players include a versioned `impact` score with combat, economy,
+utility, and survival components, each in the `-5..+5` range. Version 1
+standardizes duration-adjusted stats against the match lobby, clips component
+z-scores to `-2.5..+2.5`, and scales them by two. Combat averages hero damage per
+minute and kills-plus-assists per minute; economy averages souls per minute and
+last-hits-plus-denies per minute; utility uses healing-plus-mitigation per
+minute; survival reverses deaths per minute. The total weights those components
+at 40%, 25%, 20%, and 15% respectively. A score of zero is lobby-average; the
+score does not include a direct win bonus.
+
+Player responses include the arithmetic mean of that player's match impact
+scores and the number of matches included. The optional `?last=N` window scopes
+that average; without it, the average covers all tracked matches. Recent-match
+rows also include each match's total impact score. The formula version is
+returned so clients can identify scores produced by later revisions.
+
 The platform applies a fixed-window request limit independently to each
 collector and rejects request bodies larger than 512 KiB. The limits are
 configured with `SINGULARITY_COLLECTOR_RATE_LIMIT`,
