@@ -226,6 +226,7 @@ struct HeroAverage {
     id: u32,
     name: String,
     matches: u64,
+    icon: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -1190,7 +1191,7 @@ async fn query_player_heroes(
 ) -> Result<Vec<HeroAverage>, (StatusCode, Json<ErrorBody>)> {
     let match_filter = player_match_filter(&state.database, account_id, last_matches, "p");
     let sql = format!(
-        "SELECT p.hero_id, h.name AS hero_name, count() AS matches FROM {db}.match_players AS p LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE p.account_id = {account_id} AND p.hero_id != 0{match_filter} GROUP BY p.hero_id, h.name ORDER BY matches DESC, p.hero_id LIMIT 20",
+        "SELECT p.hero_id, h.name AS hero_name, count() AS matches, any(coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_image_small_webp'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, ''))) AS hero_icon FROM {db}.match_players AS p LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE p.account_id = {account_id} AND p.hero_id != 0{match_filter} GROUP BY p.hero_id, h.name ORDER BY matches DESC, p.hero_id LIMIT 20",
         db = state.database,
     );
     let rows = query_rows(state, &sql).await?;
@@ -1201,6 +1202,7 @@ async fn query_player_heroes(
                 id: number_u32(&row, "hero_id")?,
                 name: non_empty_string(&row, "hero_name").unwrap_or_else(|| "Unknown".to_string()),
                 matches: number_u64(&row, "matches").unwrap_or_default(),
+                icon: non_empty_string(&row, "hero_icon"),
             })
         })
         .collect())
@@ -1277,6 +1279,19 @@ mod tests {
         assert!(validate_player_limit(Some(101)).is_err());
         assert_eq!(player_match_filter("singularity", 42, None, "p"), "");
         assert!(player_match_filter("singularity", 42, Some(10), "p").contains("LIMIT 10"));
+    }
+
+    #[test]
+    fn includes_hero_icon_urls_in_player_hero_averages() {
+        let hero = HeroAverage {
+            id: 72,
+            name: "Billy".to_string(),
+            matches: 4,
+            icon: Some("https://assets.example/billy.webp".to_string()),
+        };
+        let json = serde_json::to_value(hero).unwrap();
+
+        assert_eq!(json["icon"], "https://assets.example/billy.webp");
     }
 
     #[test]
