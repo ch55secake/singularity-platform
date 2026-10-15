@@ -1,3 +1,7 @@
 /target/
 /data/
 .env
+
+# Real decompressed .meta files for parses_sample_metadata_files; they contain
+# Steam account IDs, so never commit them.
+tests/fixtures/
