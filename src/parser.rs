@@ -17,7 +17,7 @@ use tokio::{
     fs::{self, OpenOptions},
     io::AsyncWriteExt,
 };
-use valveprotos::deadlock::CMsgMatchMetaDataContents;
+use valveprotos::deadlock::{CMsgMatchMetaData, CMsgMatchMetaDataContents};
 
 use valveprotos::deadlock::c_msg_match_meta_data_contents::{Items, Players, Position};
 
@@ -465,7 +465,7 @@ impl ParseState {
 }
 
 fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
-    let contents = CMsgMatchMetaDataContents::decode(bytes).map_err(|_| {
+    let contents = decode_contents(bytes).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid metadata protobuf")
     })?;
     let info = contents.match_info.ok_or_else(|| {
@@ -791,6 +791,20 @@ fn world_coordinate(
     Some(minimum + position as f32 / resolution as f32 * (maximum - minimum))
 }
 
+/// Valve's `.meta` files hold a `CMsgMatchMetaData` wrapper (version, match ID)
+/// whose `match_details` bytes are the `CMsgMatchMetaDataContents`. Bare
+/// contents are still accepted.
+fn decode_contents(bytes: &[u8]) -> Option<CMsgMatchMetaDataContents> {
+    if let Ok(outer) = CMsgMatchMetaData::decode(bytes)
+        && let Some(details) = outer.match_details
+        && let Ok(contents) = CMsgMatchMetaDataContents::decode(details.as_slice())
+        && contents.match_info.is_some()
+    {
+        return Some(contents);
+    }
+    CMsgMatchMetaDataContents::decode(bytes).ok()
+}
+
 fn metadata_version(bytes: &[u8]) -> u64 {
     let digest = Sha256::digest(bytes);
     u64::from_le_bytes(digest[..8].try_into().expect("digest has eight bytes"))
@@ -960,6 +974,42 @@ mod tests {
         assert_eq!(parsed.stat_rows[0].headshot_kills, Some(3));
         assert_eq!(parsed.stat_rows[0].player_damage_taken, Some(7_500));
         assert_eq!(parsed.match_row.metadata_version, metadata_version(&bytes));
+    }
+
+    #[test]
+    fn decodes_contents_inside_valve_wrapper() {
+        let contents = CMsgMatchMetaDataContents {
+            match_info: Some(MatchInfo {
+                match_id: Some(42),
+                duration_s: Some(1_800),
+                ..Default::default()
+            }),
+        };
+        let wrapped = CMsgMatchMetaData {
+            version: Some(1),
+            match_details: Some(contents.encode_to_vec()),
+            match_id: Some(42),
+        }
+        .encode_to_vec();
+
+        let parsed = parse_metadata(&wrapped).expect("wrapped metadata parses");
+
+        assert_eq!(parsed.match_row.match_id, 42);
+        assert_eq!(parsed.match_row.duration_s, Some(1_800));
+    }
+
+    #[test]
+    fn parses_sample_metadata_files() {
+        // Decompressed .meta files can be dropped in tests/fixtures/ to check
+        // real Valve data; the directory is optional.
+        let Ok(entries) = std::fs::read_dir("tests/fixtures") else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let bytes = std::fs::read(entry.path()).expect("fixture reads");
+            let parsed = parse_metadata(&bytes).expect("sample metadata parses");
+            assert!(parsed.match_row.match_id > 0);
+        }
     }
 
     #[test]
