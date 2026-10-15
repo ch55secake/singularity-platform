@@ -4,6 +4,7 @@
 mod assets;
 mod discord;
 mod discord_live;
+mod live;
 mod metadata;
 mod parser;
 mod read_api;
@@ -61,6 +62,7 @@ struct AppState {
     max_batch_size: usize,
     authentication_required: bool,
     read_api: read_api::ReadApiState,
+    live: Arc<Mutex<live::LiveStore>>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
@@ -206,6 +208,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let max_batch_size = configured_batch_size()?;
     let rate_limit = configured_rate_limit()?;
     let read_api = read_api::ReadApiState::from_env()?;
+    let live_path = live::store_path(&spool_path);
+    let live_store = live::LiveStore::load(&live_path).await?;
 
     let state = AppState {
         legacy_token,
@@ -217,10 +221,16 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         max_batch_size,
         authentication_required,
         read_api,
+        live: Arc::new(Mutex::new(live_store)),
     };
+    tokio::spawn(live::fetch_salts(state.clone()));
     let app = Router::new()
         .route("/health", get(health))
         .route("/ingest/salts", post(ingest_salts))
+        .route("/ingest/live", post(live::report))
+        // Not under /api: the web app proxies /api to browsers, and this list
+        // carries Steam account IDs for the Discord bot.
+        .route("/live", get(live::list))
         .route("/matches", get(read_api::list_matches))
         .route("/events/matches", get(read_api::list_processed_events))
         .route("/matches/{identifier}", get(read_api::get_match))
@@ -319,6 +329,18 @@ async fn ingest_salts(
         record.collector_id = Some(collector_id.clone());
     }
 
+    let (accepted, duplicates) = store_records(&state, records).await?;
+    Ok(Json(IngestBody {
+        accepted,
+        duplicates,
+    }))
+}
+
+/// Appends new salt records to the spool. Returns (accepted, duplicates).
+async fn store_records(
+    state: &AppState,
+    records: Vec<SaltRecord>,
+) -> Result<(usize, usize), (StatusCode, Json<ErrorBody>)> {
     let mut seen = state.seen.lock().await;
     let mut spool = state.spool.lock().await;
     let mut accepted = 0;
@@ -340,11 +362,7 @@ async fn ingest_salts(
     }
     spool.flush().await.map_err(|_| internal_error())?;
     spool.sync_data().await.map_err(|_| internal_error())?;
-
-    Ok(Json(IngestBody {
-        accepted,
-        duplicates,
-    }))
+    Ok((accepted, duplicates))
 }
 
 async fn load_seen(path: &Path) -> Result<HashSet<SaltKey>, std::io::Error> {
@@ -914,6 +932,9 @@ mod tests {
             max_batch_size: MAX_BATCH_SIZE,
             authentication_required: true,
             read_api: read_api::ReadApiState::from_env().expect("read API state initializes"),
+            live: Arc::new(Mutex::new(live::LiveStore::empty(
+                spool_path.with_extension("live.jsonl"),
+            ))),
         };
         let mut headers = HeaderMap::new();
         headers.insert(

@@ -625,7 +625,7 @@ fn read_members() -> Result<HashMap<u32, String>, std::io::Error> {
         .collect()
 }
 
-fn authorize(
+pub(crate) fn authorize(
     headers: &HeaderMap,
     state: &ReadApiState,
 ) -> Result<(), (StatusCode, Json<ErrorBody>)> {
