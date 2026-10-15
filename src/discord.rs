@@ -45,6 +45,8 @@ const STEAM64_BASE: u64 = 76561197960265728;
 const LIVE_POSTED_LIMIT: usize = 200;
 // How often the bot checks for matches that collectors reported starting.
 const REPORTED_POLL_INTERVAL: Duration = Duration::from_secs(20);
+// Waits before retrying a live broadcast lookup that hit a server error.
+const BROADCAST_RETRY_WAITS: [Duration; 2] = [Duration::from_secs(60), Duration::from_secs(120)];
 // A reported match older than this is not posted as live any more.
 const REPORTED_MAX_AGE_SECONDS: u64 = 40 * 60;
 // Matches reported this recently get an after-match post.
@@ -949,10 +951,24 @@ impl Service {
         self.remember_live_post(report.match_id).await?;
         info!(match_id = report.match_id, "Posted match found");
 
-        let active = match live
+        let mut lookup = live
             .broadcast_players(report.match_id, report.started_at)
-            .await
-        {
+            .await;
+        // Server errors and timeouts are usually brief; each try uses one of the
+        // 6 lookups per hour, so try at most three times.
+        for wait in BROADCAST_RETRY_WAITS {
+            match &lookup {
+                Err(error) if is_transient(error.as_ref()) => {
+                    warn!(match_id = report.match_id, %error, retry_in_seconds = wait.as_secs(), "Live broadcast lookup failed; retrying");
+                    tokio::time::sleep(wait).await;
+                    lookup = live
+                        .broadcast_players(report.match_id, report.started_at)
+                        .await;
+                }
+                _ => break,
+            }
+        }
+        let active = match lookup {
             Ok(active) => Some(active),
             Err(error) => {
                 warn!(match_id = report.match_id, %error, "Live broadcast lookup failed; trying the watch-tab feed");
@@ -1090,6 +1106,19 @@ impl Service {
         self.config.channel_id.send_message(http, message).await?;
         Ok(())
     }
+}
+
+/// Server errors, timeouts and dropped connections are worth retrying; a
+/// rejected query or an error event from the stream is not.
+fn is_transient(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool {
+    error.downcast_ref::<reqwest::Error>().is_some_and(|error| {
+        error.is_timeout()
+            || error.is_connect()
+            || error.is_body()
+            || error
+                .status()
+                .is_some_and(|status| status.is_server_error())
+    })
 }
 
 /// " for @a, @b" naming the linked players who reported the match.
@@ -1578,6 +1607,12 @@ mod tests {
         );
         let message = serde_json::json!({"content": post.content, "embeds": post.embeds});
         println!("{message}");
+    }
+
+    #[test]
+    fn only_request_failures_are_retried() {
+        let rejected: Box<dyn std::error::Error + Send + Sync> = "Invalid query".into();
+        assert!(!is_transient(rejected.as_ref()));
     }
 
     #[test]
