@@ -54,14 +54,17 @@ browser link to a player page without exposing or accepting a Steam account ID.
 The match detail response includes the final player-stat snapshot, every stats
 timeline row, source-normalized damage, item/ability events, death events,
 world-coordinate paths, time-stamped objective and mid-boss events with map
-positions when available, and the current map asset. Missing optional metadata
-is represented by nulls or empty arrays. A healthy service returns `503` for
-read requests when ClickHouse is unavailable.
+positions when available, current map objective positions, and the current map
+asset. Missing optional metadata is represented by nulls or empty arrays. A
+healthy service returns `503` for read requests when ClickHouse is unavailable.
 
 Each objective event includes `t` (seconds since match start), `kind`, and
 `team` (the structure's owning team, or the claiming team for `mid_boss`). Its
-`position` is an `[x, y]` world-coordinate pair or `null` when the current map
-assets do not provide a location for that objective.
+`position_key` identifies the map-asset key used to resolve its location, when
+known. `position` is an `[x, y]` world-coordinate pair or `null` when the current
+map assets do not provide a location for that objective. The `mid_boss` map marker
+uses the center of the map. `map.objective_positions` maps supported objective
+keys to world-coordinate `[x, y]` pairs for rendering standing objectives.
 
 Match detail players include a versioned `impact` score with combat, economy,
 utility, and survival components, each in the `-5..+5` range. Version 1
