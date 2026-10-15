@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::{BTreeMap, HashMap, HashSet},
     env,
     fmt::{self, Display},
     path::{Path, PathBuf},
@@ -41,6 +41,12 @@ const EVENT_PAGE_LIMIT: usize = 100;
 const STEAM64_BASE: u64 = 76561197960265728;
 // Live match IDs remembered so each live match is posted once.
 const LIVE_POSTED_LIMIT: usize = 200;
+// How often the bot checks for matches that collectors reported starting.
+const REPORTED_POLL_INTERVAL: Duration = Duration::from_secs(20);
+// A reported match older than this is not posted as live any more.
+const REPORTED_MAX_AGE_SECONDS: u64 = 40 * 60;
+// Matches reported this recently get an after-match post.
+const TRACKED_WINDOW_SECONDS: u64 = 24 * 60 * 60;
 
 #[derive(Debug)]
 struct Config {
@@ -69,6 +75,18 @@ struct ApiMatchEvent {
     uuid: String,
     match_id: u64,
     start_time: u32,
+}
+
+/// A match that a collector reported starting or ending.
+#[derive(Debug, Clone, Deserialize)]
+struct ApiLiveMatch {
+    match_id: u64,
+    #[serde(default)]
+    started_at: Option<u64>,
+    #[serde(default)]
+    ended_at: Option<u64>,
+    #[serde(default)]
+    account_ids: Vec<u32>,
 }
 
 #[derive(Debug, Clone, Deserialize)]
@@ -163,6 +181,8 @@ struct Service {
     live: Option<LiveScout>,
     state: Arc<Mutex<State>>,
     http: Arc<Mutex<Option<Arc<Http>>>>,
+    // Live matches being looked up, so the two live sources don't both post one.
+    live_in_flight: Mutex<HashSet<u64>>,
 }
 
 struct Handler {
@@ -191,6 +211,7 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         live,
         state,
         http: Arc::new(Mutex::new(None)),
+        live_in_flight: Mutex::new(HashSet::new()),
     });
 
     let mut client = DiscordClient::builder(&config.token, GatewayIntents::empty())
@@ -202,9 +223,12 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let poll_task = tokio::spawn(async move { poll_notifications(poll_service).await });
     let live_service = Arc::clone(&service);
     let live_task = tokio::spawn(async move { poll_live_matches(live_service).await });
+    let reported_service = Arc::clone(&service);
+    let reported_task = tokio::spawn(async move { poll_reported_matches(reported_service).await });
     let result = client.start().await;
     poll_task.abort();
     live_task.abort();
+    reported_task.abort();
     result?;
     Ok(())
 }
@@ -278,7 +302,15 @@ impl ApiClient {
     }
 
     async fn get<T: DeserializeOwned>(&self, path: &str) -> Result<T, ApiError> {
-        let url = format!("{}/{}", self.base_url, path.trim_start_matches('/'));
+        self.get_url(format!(
+            "{}/{}",
+            self.base_url,
+            path.trim_start_matches('/')
+        ))
+        .await
+    }
+
+    async fn get_url<T: DeserializeOwned>(&self, url: String) -> Result<T, ApiError> {
         let mut request = self.http.get(url);
         if let Some(token) = &self.token {
             request = request.bearer_auth(token);
@@ -303,6 +335,13 @@ impl ApiClient {
             "events/matches?limit=100&after_start_time={after_start_time}&after_match_id={after_match_id}"
         ))
         .await
+    }
+
+    /// The live report list sits at the platform root, outside `/api`, so the
+    /// web app's proxy never serves its account IDs to browsers.
+    async fn list_live(&self, since: u64) -> Result<Vec<ApiLiveMatch>, ApiError> {
+        let root = self.base_url.strip_suffix("/api").unwrap_or(&self.base_url);
+        self.get_url(format!("{root}/live?since={since}")).await
     }
 
     async fn get_match(&self, identifier: &str) -> Result<ApiMatchDetail, ApiError> {
@@ -488,7 +527,7 @@ impl Service {
             .first()
             .ok_or_else(|| ApiError("That player has no processed matches yet.".into()))?;
         let detail = self.api.get_match(&recent.uuid).await?;
-        Ok(Reply::Embed(Box::new(self.match_embed(&detail))))
+        Ok(Reply::Embed(Box::new(self.match_embed(&detail, &[]))))
     }
 
     async fn handle_match(&self, options: &[ResolvedOption<'_>]) -> Result<Reply, ApiError> {
@@ -498,7 +537,7 @@ impl Service {
             ));
         };
         let detail = self.api.get_match(&identifier).await?;
-        Ok(Reply::Embed(Box::new(self.match_embed(&detail))))
+        Ok(Reply::Embed(Box::new(self.match_embed(&detail, &[]))))
     }
 
     async fn handle_stats(
@@ -600,7 +639,8 @@ impl Service {
         }
     }
 
-    fn match_embed(&self, detail: &ApiMatchDetail) -> CreateEmbed {
+    /// `played_by` lists the Discord users whose collectors reported the match.
+    fn match_embed(&self, detail: &ApiMatchDetail, played_by: &[u64]) -> CreateEmbed {
         let group_players = detail
             .players
             .iter()
@@ -615,6 +655,15 @@ impl Service {
             "Match complete"
         } else {
             "Group loss"
+        };
+        let played_by = if played_by.is_empty() {
+            String::new()
+        } else {
+            let users = played_by
+                .iter()
+                .map(|user| format!("<@{user}>"))
+                .collect::<Vec<_>>();
+            format!("Played by {}\n", users.join(", "))
         };
         let player_lines = detail
             .players
@@ -646,7 +695,7 @@ impl Service {
         let mut embed = CreateEmbed::new()
             .title(format!("{} — {}", result, detail.mode))
             .description(format!(
-                "{}\n[Open match in Singularity]({}/m/{})",
+                "{played_by}{}\n[Open match in Singularity]({}/m/{})",
                 format_duration(detail.duration_s),
                 self.config.web_url.trim_end_matches('/'),
                 detail.uuid
@@ -760,6 +809,19 @@ async fn poll_notifications(service: Arc<Service>) {
     }
 }
 
+async fn poll_reported_matches(service: Arc<Service>) {
+    if service.live.is_none() {
+        return;
+    }
+    let mut ticker = interval(REPORTED_POLL_INTERVAL);
+    loop {
+        ticker.tick().await;
+        if let Err(error) = service.poll_reported_once().await {
+            warn!(%error, "Reported live match poll failed");
+        }
+    }
+}
+
 async fn poll_live_matches(service: Arc<Service>) {
     let Some(live) = service.live.as_ref() else {
         return;
@@ -811,23 +873,128 @@ impl Service {
                 .file
                 .live_posted
                 .contains(&active.match_id);
-            if !has_linked || posted {
+            if !has_linked || posted || !self.live_in_flight.lock().await.insert(active.match_id) {
                 continue;
             }
-            let embed = live.scout(&active, &linked).await;
-            self.service_send_message(&http, CreateMessage::new().embed(embed))
-                .await?;
-            let mut state = self.state.lock().await;
-            state.file.live_posted.push(active.match_id);
-            let excess = state
-                .file
-                .live_posted
-                .len()
-                .saturating_sub(LIVE_POSTED_LIMIT);
-            state.file.live_posted.drain(..excess);
-            state.save().await?;
+            let embed = live.scout(&active, &linked, &[]).await;
+            let sent = self
+                .service_send_message(&http, CreateMessage::new().embed(embed))
+                .await
+                .map_err(|error| error.to_string());
+            if sent.is_ok() {
+                self.remember_live_post(active.match_id).await?;
+            }
+            self.live_in_flight.lock().await.remove(&active.match_id);
+            sent?;
         }
         Ok(())
+    }
+
+    fn linked_accounts(state: &State) -> HashMap<u32, u64> {
+        state
+            .file
+            .links
+            .iter()
+            .filter_map(|(user_id, link)| Some((link.account_id, user_id.parse::<u64>().ok()?)))
+            .collect()
+    }
+
+    async fn remember_live_post(&self, match_id: u64) -> Result<(), Box<dyn std::error::Error>> {
+        let mut state = self.state.lock().await;
+        state.file.live_posted.push(match_id);
+        let excess = state
+            .file
+            .live_posted
+            .len()
+            .saturating_sub(LIVE_POSTED_LIMIT);
+        state.file.live_posted.drain(..excess);
+        state.save().await
+    }
+
+    /// Starts a lookup for each match a collector reported starting.
+    async fn poll_reported_once(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
+        if self.live.is_none() || self.http.lock().await.is_none() {
+            return Ok(());
+        }
+        let now = now_seconds();
+        let reported = self
+            .api
+            .list_live(now.saturating_sub(REPORTED_MAX_AGE_SECONDS))
+            .await?;
+        for report in reported {
+            let Some(started_at) = report.started_at else {
+                continue;
+            };
+            let fresh = report.ended_at.is_none()
+                && now.saturating_sub(started_at) < REPORTED_MAX_AGE_SECONDS;
+            let posted = self
+                .state
+                .lock()
+                .await
+                .file
+                .live_posted
+                .contains(&report.match_id);
+            if !fresh || posted || !self.live_in_flight.lock().await.insert(report.match_id) {
+                continue;
+            }
+            let service = Arc::clone(self);
+            tokio::spawn(async move {
+                let match_id = report.match_id;
+                if let Err(error) = service.post_reported(report).await {
+                    warn!(match_id, %error, "Reported live match could not be posted");
+                }
+                service.live_in_flight.lock().await.remove(&match_id);
+            });
+        }
+        Ok(())
+    }
+
+    /// Reads the teams from the live broadcast, falling back to the watch-tab feed.
+    async fn post_reported(&self, report: ApiLiveMatch) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(live) = self.live.as_ref() else {
+            return Ok(());
+        };
+        let active = match live
+            .broadcast_players(report.match_id, report.started_at)
+            .await
+        {
+            Ok(active) => active,
+            Err(error) => {
+                warn!(match_id = report.match_id, %error, "Live broadcast lookup failed; trying the watch-tab feed");
+                let feed = live
+                    .active_matches(&report.account_ids)
+                    .await
+                    .map_err(|error| error.to_string())?;
+                let Some(active) = feed
+                    .into_iter()
+                    .find(|active| active.match_id == report.match_id)
+                else {
+                    // Don't try again: each broadcast lookup uses up the hourly limit.
+                    self.remember_live_post(report.match_id).await?;
+                    return Err(format!("teams unavailable: {error}").into());
+                };
+                active
+            }
+        };
+        if self
+            .state
+            .lock()
+            .await
+            .file
+            .live_posted
+            .contains(&report.match_id)
+        {
+            return Ok(());
+        }
+        let linked = Self::linked_accounts(&*self.state.lock().await);
+        let embed = live.scout(&active, &linked, &report.account_ids).await;
+        let Some(http) = self.http.lock().await.clone() else {
+            return Ok(());
+        };
+        self.service_send_message(&http, CreateMessage::new().embed(embed))
+            .await?;
+        info!(match_id = report.match_id, "Posted reported live match");
+        self.remember_live_post(report.match_id).await
     }
 
     async fn poll_once(&self) -> Result<(), Box<dyn std::error::Error>> {
@@ -879,10 +1046,32 @@ impl Service {
             state.save().await?;
             return Ok(());
         }
+        // Matches our collectors reported live get a post even without
+        // configured members, naming the linked players who were in them.
+        let reported = if events.is_empty() {
+            HashMap::new()
+        } else {
+            self.api
+                .list_live(now_seconds().saturating_sub(TRACKED_WINDOW_SECONDS))
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|live| (live.match_id, live.account_ids))
+                .collect::<HashMap<_, _>>()
+        };
+        let linked = Self::linked_accounts(&state);
         for event in events {
             let detail = self.api.get_match(&event.uuid).await?;
-            if detail.players.iter().any(|player| player.member.is_some()) {
-                let message = CreateMessage::new().embed(self.match_embed(&detail));
+            let reporters = reported.get(&event.match_id);
+            if reporters.is_some() || detail.players.iter().any(|player| player.member.is_some()) {
+                let mut played_by = reporters
+                    .into_iter()
+                    .flatten()
+                    .filter_map(|account_id| linked.get(account_id).copied())
+                    .collect::<Vec<_>>();
+                played_by.sort_unstable();
+                played_by.dedup();
+                let message = CreateMessage::new().embed(self.match_embed(&detail, &played_by));
                 self.service_send_message(&http, message).await?;
             }
             state.file.last_start_time = event.start_time;

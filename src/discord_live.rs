@@ -2,11 +2,16 @@
 //!
 //! When a linked player is in a live match, the bot posts both teams with each
 //! player's rank, recent form and experience on their hero. Live matches come
-//! from the community Deadlock API's active-match feed, which mirrors the
-//! in-game watch tab and only lists about the top 200 matches being played.
+//! from two places:
+//!
+//! - collectors report the match ID when a match starts, and the bot reads the
+//!   players from the match's live broadcast through the community Deadlock
+//!   API (`/v1/matches/demo/live/query`, 6 lookups per hour per IP); and
+//! - the community API's active-match feed, which mirrors the in-game watch tab
+//!   and only lists about the top 200 matches being played.
 
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     env,
     sync::Arc,
     time::{Duration, Instant},
@@ -27,6 +32,12 @@ const LOOKUP_CONCURRENCY: usize = 6;
 const NAMES_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const FIELD_LIMIT: usize = 1024;
 const TEAM_NAMES: [&str; 2] = ["Amber Hand", "Sapphire Flame"];
+const STEAM64_BASE: u64 = 76561197960265728;
+/// The broadcast can take a few minutes to start after the lobby forms.
+const BROADCAST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
+/// Ticks to read after the first one, so every player controller is seen.
+const SNAPSHOT_TICKS: u64 = 64;
+const PLAYERS_QUERY: &str = "SELECT tick, \"m_steamID\" AS steam_id, \"m_iTeamNum\" AS team, \"m_PlayerDataGlobal__m_nHeroID\" AS hero_id FROM CCitadelPlayerController WHERE \"m_PlayerDataGlobal__m_nHeroID\" > 0";
 
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct ActiveMatch {
@@ -49,6 +60,73 @@ pub(crate) struct ActivePlayer {
     team: Option<i32>,
     #[serde(default)]
     hero_id: Option<u32>,
+}
+
+/// One player controller row from the live broadcast query.
+#[derive(Debug, Deserialize)]
+struct BroadcastRow {
+    tick: u64,
+    steam_id: u64,
+    team: i32,
+    hero_id: u32,
+}
+
+#[derive(Debug, Deserialize)]
+struct BroadcastError {
+    #[serde(default)]
+    error: Option<String>,
+}
+
+/// Collects the players seen in the first ticks of a broadcast.
+#[derive(Debug, Default)]
+pub(crate) struct Snapshot {
+    first_tick: Option<u64>,
+    players: BTreeMap<u32, ActivePlayer>,
+}
+
+impl Snapshot {
+    /// Adds one row; returns true once the snapshot is complete.
+    fn add(&mut self, row: BroadcastRow) -> bool {
+        let first_tick = *self.first_tick.get_or_insert(row.tick);
+        if row.tick > first_tick + SNAPSHOT_TICKS {
+            return true;
+        }
+        let Some(account_id) = row
+            .steam_id
+            .checked_sub(STEAM64_BASE)
+            .and_then(|id| u32::try_from(id).ok())
+            .filter(|id| *id > 0)
+        else {
+            return false;
+        };
+        // The broadcast numbers teams 2 (Amber Hand) and 3 (Sapphire Flame).
+        let team = match row.team {
+            2 => 0,
+            3 => 1,
+            _ => return false,
+        };
+        self.players.insert(
+            account_id,
+            ActivePlayer {
+                account_id: Some(account_id),
+                team: Some(team),
+                hero_id: Some(row.hero_id),
+            },
+        );
+        false
+    }
+
+    pub(crate) fn into_match(self, match_id: u64, start_time: Option<u64>) -> ActiveMatch {
+        let mut players = self.players.into_values().collect::<Vec<_>>();
+        players.sort_by_key(|player| (player.team, player.hero_id));
+        ActiveMatch {
+            match_id,
+            start_time,
+            match_mode_parsed: None,
+            region_mode_parsed: None,
+            players,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -148,6 +226,51 @@ impl LiveScout {
         .await
     }
 
+    /// Reads the players of a match from its live broadcast. Waits while the
+    /// community API reports that the broadcast is not ready yet.
+    pub(crate) async fn broadcast_players(
+        &self,
+        match_id: u64,
+        start_time: Option<u64>,
+    ) -> LiveResult<ActiveMatch> {
+        let mut response = self
+            .http
+            .get(format!("{}/v1/matches/demo/live/query", self.base_url))
+            .query(&[
+                ("match_id", match_id.to_string()),
+                ("query", PLAYERS_QUERY.to_string()),
+            ])
+            .timeout(BROADCAST_TIMEOUT)
+            .send()
+            .await?
+            .error_for_status()?;
+        let mut parser = SseParser::default();
+        let mut snapshot = Snapshot::default();
+        while let Some(chunk) = response.chunk().await? {
+            for (event, data) in parser.push(&chunk) {
+                match event.as_deref() {
+                    Some("error") => {
+                        let message = serde_json::from_str::<BroadcastError>(&data)
+                            .ok()
+                            .and_then(|error| error.error)
+                            .unwrap_or(data);
+                        return Err(message.into());
+                    }
+                    Some("end") => return finish(snapshot, match_id, start_time),
+                    Some(_) => {}
+                    None => {
+                        if let Ok(row) = serde_json::from_str::<BroadcastRow>(&data)
+                            && snapshot.add(row)
+                        {
+                            return finish(snapshot, match_id, start_time);
+                        }
+                    }
+                }
+            }
+        }
+        finish(snapshot, match_id, start_time)
+    }
+
     async fn names(&self) -> Arc<Names> {
         let mut cached = self.names.lock().await;
         if let Some((loaded_at, names)) = cached.as_ref()
@@ -170,11 +293,14 @@ impl LiveScout {
         names
     }
 
-    /// Build the post for one live match. `linked` maps account IDs to Discord user IDs.
+    /// Build the post for one live match. `linked` maps account IDs to Discord
+    /// user IDs; `friends` are more accounts on "your team", such as the
+    /// players whose collectors reported the match.
     pub(crate) async fn scout(
         &self,
         live: &ActiveMatch,
         linked: &HashMap<u32, u64>,
+        friends: &[u32],
     ) -> CreateEmbed {
         let names = self.names().await;
         let account_ids = live
@@ -248,7 +374,10 @@ impl LiveScout {
             let discord_user = player
                 .account_id
                 .and_then(|account_id| linked.get(&account_id).copied());
-            friend_teams[team] |= discord_user.is_some();
+            friend_teams[team] |= discord_user.is_some()
+                || player
+                    .account_id
+                    .is_some_and(|account_id| friends.contains(&account_id));
             let (badge, summary) = results.remove(&index).unwrap_or((None, None));
             let hero_id = player.hero_id.unwrap_or_default();
             let hero = names
@@ -277,6 +406,39 @@ impl LiveScout {
 }
 
 type LiveResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+fn finish(snapshot: Snapshot, match_id: u64, start_time: Option<u64>) -> LiveResult<ActiveMatch> {
+    if snapshot.players.is_empty() {
+        return Err("the live broadcast ended before any players were seen".into());
+    }
+    Ok(snapshot.into_match(match_id, start_time))
+}
+
+/// Splits a Server-Sent Events stream into (event name, data) pairs.
+#[derive(Debug, Default)]
+struct SseParser {
+    buffer: String,
+    event: Option<String>,
+}
+
+impl SseParser {
+    fn push(&mut self, chunk: &[u8]) -> Vec<(Option<String>, String)> {
+        self.buffer.push_str(&String::from_utf8_lossy(chunk));
+        let mut messages = Vec::new();
+        while let Some(end) = self.buffer.find('\n') {
+            let line = self.buffer[..end].trim_end_matches('\r').to_string();
+            self.buffer.drain(..=end);
+            if line.is_empty() {
+                self.event = None;
+            } else if let Some(event) = line.strip_prefix("event:") {
+                self.event = Some(event.trim().to_string());
+            } else if let Some(data) = line.strip_prefix("data:") {
+                messages.push((self.event.clone(), data.trim_start().to_string()));
+            }
+        }
+        messages
+    }
+}
 
 async fn get_json<T: DeserializeOwned>(
     http: &HttpClient,
@@ -493,6 +655,56 @@ mod tests {
     }
 
     #[test]
+    fn sse_parser_splits_events_across_chunks() {
+        let mut parser = SseParser::default();
+        assert!(
+            parser
+                .push(b"event: status\ndata: {\"message\":\"not ready\"}")
+                .is_empty()
+        );
+        let messages = parser.push(b"\n\ndata: {\"tick\":1}\r\n\nevent: end\ndata: {}\n\n");
+        assert_eq!(
+            messages,
+            vec![
+                (Some("status".into()), "{\"message\":\"not ready\"}".into()),
+                (None, "{\"tick\":1}".into()),
+                (Some("end".into()), "{}".into()),
+            ]
+        );
+    }
+
+    #[test]
+    fn snapshot_reads_players_from_the_first_ticks() {
+        let row = |tick, steam_id, team, hero_id| BroadcastRow {
+            tick,
+            steam_id,
+            team,
+            hero_id,
+        };
+        let mut snapshot = Snapshot::default();
+        assert!(!snapshot.add(row(14731, 76561198063672350, 3, 6)));
+        assert!(!snapshot.add(row(14731, 76561198208794271, 2, 67)));
+        assert!(!snapshot.add(row(14732, 76561198208794271, 2, 67)));
+        assert!(!snapshot.add(row(14732, 0, 2, 1)));
+        assert!(snapshot.add(row(14731 + SNAPSHOT_TICKS + 1, 76561198000000000, 2, 1)));
+
+        let live = snapshot.into_match(117420947, Some(10));
+        let players = live
+            .players
+            .iter()
+            .map(|player| (player.account_id, player.team, player.hero_id))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            players,
+            vec![
+                (Some(248528543), Some(0), Some(67)),
+                (Some(103406622), Some(1), Some(6)),
+            ]
+        );
+        assert_eq!(live.start_time, Some(10));
+    }
+
+    #[test]
     fn rank_label_splits_badge_into_tier_and_subrank() {
         let names = HashMap::from([(8, "Oracle".to_string()), (11, "Eternus".to_string())]);
 
@@ -594,7 +806,7 @@ mod tests {
         let friend = all[0].players[3].account_id.unwrap();
         let matches = scout.active_matches(&[friend]).await.unwrap();
         let embed = scout
-            .scout(&matches[0], &HashMap::from([(friend, 1)]))
+            .scout(&matches[0], &HashMap::from([(friend, 1)]), &[])
             .await;
         let embed = serde_json::to_value(embed).unwrap();
         println!("{}", serde_json::to_string_pretty(&embed).unwrap());
