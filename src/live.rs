@@ -39,6 +39,9 @@ const RETENTION_SECONDS: u64 = 24 * 60 * 60;
 const DEFAULT_LIST_SECONDS: u64 = 6 * 60 * 60;
 /// Give the local Steam cache an hour to expose the match salts before falling back.
 const AFTER_END_SECONDS: u64 = 60 * 60;
+/// A lobby destroyed this soon after it formed was cancelled (someone failed
+/// to load in), so there is no match to fetch.
+pub(crate) const CANCELLED_WITHIN_SECONDS: u64 = 5 * 60;
 /// Without an end report, assume a match is over this long after it started.
 const ASSUMED_LENGTH_SECONDS: u64 = 45 * 60;
 /// Stop asking for a match's salts this long after it was first reported.
@@ -141,8 +144,20 @@ impl LiveMatch {
         due.max(self.next_attempt_at)
     }
 
+    fn cancelled(&self) -> bool {
+        match (self.started_at, self.ended_at) {
+            (Some(started), Some(ended)) => {
+                ended.saturating_sub(started) < CANCELLED_WITHIN_SECONDS
+            }
+            _ => false,
+        }
+    }
+
     fn wants_salts(&self, now: u64) -> bool {
-        !self.salts_stored && now < self.first_seen + GIVE_UP_SECONDS && now >= self.salts_due_at()
+        !self.salts_stored
+            && !self.cancelled()
+            && now < self.first_seen + GIVE_UP_SECONDS
+            && now >= self.salts_due_at()
     }
 }
 
@@ -531,6 +546,23 @@ mod tests {
         assert!(!live.wants_salts(1_000 + GIVE_UP_SECONDS));
         live.salts_stored = true;
         assert!(!live.wants_salts(3_000));
+    }
+
+    #[test]
+    fn cancelled_lobbies_are_never_fetched() {
+        let live = LiveMatch {
+            match_id: 5,
+            first_seen: 1_000,
+            started_at: Some(1_000),
+            ended_at: Some(1_078),
+            ..LiveMatch::default()
+        };
+        assert!(!live.wants_salts(1_000 + GIVE_UP_SECONDS - 1));
+        let real = LiveMatch {
+            ended_at: Some(1_000 + CANCELLED_WITHIN_SECONDS),
+            ..live
+        };
+        assert!(real.wants_salts(1_000 + CANCELLED_WITHIN_SECONDS + AFTER_END_SECONDS));
     }
 
     #[test]
