@@ -222,9 +222,14 @@ echo account IDs, and `/stats` supports an optional last-match window.
 ### Live match posts
 
 While a linked player is in a live match, the bot posts both teams to the same
-channel, with the linked player's team first. Each line shows the player's
-hero, Steam name, rank, W-L and KDA over their last 20 matches, and their match
-count and win rate on that hero. Each match is posted once; the last 200 posted
+channel, with the linked player's team first. Friends (linked players and the
+players whose collectors reported the match) get a short line with their hero.
+Everyone else gets their rank, games and win rate on their hero over their whole
+history (`/v1/players/hero-stats`), and W-L over their last 20 matches. A
+`🔗 stack A` tag marks teammates who were on the same team in at least 2 of
+their last 30 games, which in practice means they queue together. For a
+collector-reported match the bot posts "Match found" as soon as the report
+arrives and fills in the teams when the live broadcast opens. Each match is posted once; the last 200 posted
 match IDs are kept in the bot state file as `live_posted`.
 
 Live matches come from two places:

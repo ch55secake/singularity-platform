@@ -32,6 +32,10 @@ const LOOKUP_CONCURRENCY: usize = 6;
 const NAMES_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 const FIELD_LIMIT: usize = 1024;
 const TEAM_NAMES: [&str; 2] = ["Amber Hand", "Sapphire Flame"];
+/// Recent games per player searched for shared matches.
+const STACK_WINDOW: usize = 30;
+/// Same-team games two players must share to count as a stack.
+const STACK_MIN_SHARED: usize = 2;
 const STEAM64_BASE: u64 = 76561197960265728;
 /// The broadcast can take a few minutes to start after the lobby forms.
 const BROADCAST_TIMEOUT: Duration = Duration::from_secs(15 * 60);
@@ -132,6 +136,8 @@ impl Snapshot {
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct HistoryEntry {
     #[serde(default)]
+    match_id: Option<u64>,
+    #[serde(default)]
     hero_id: Option<u32>,
     #[serde(default)]
     player_kills: Option<u32>,
@@ -143,6 +149,31 @@ pub(crate) struct HistoryEntry {
     match_result: Option<i32>,
     #[serde(default)]
     player_team: Option<i32>,
+}
+
+/// A player's games and wins on one hero, over their whole history.
+#[derive(Debug, Deserialize)]
+struct HeroStat {
+    account_id: u32,
+    hero_id: u32,
+    #[serde(default)]
+    matches_played: u32,
+    #[serde(default)]
+    wins: u32,
+}
+
+/// Everything shown on one player's line.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct PlayerCard {
+    pub(crate) name: String,
+    pub(crate) hero: String,
+    pub(crate) discord_user: Option<u64>,
+    pub(crate) friend: bool,
+    pub(crate) rank: String,
+    /// (games, wins) on the hero being played.
+    pub(crate) hero_games: Option<(u32, u32)>,
+    pub(crate) summary: Option<Summary>,
+    pub(crate) stack: Option<char>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -294,8 +325,10 @@ impl LiveScout {
     }
 
     /// Build the post for one live match. `linked` maps account IDs to Discord
-    /// user IDs; `friends` are more accounts on "your team", such as the
-    /// players whose collectors reported the match.
+    /// user IDs; `friends` are more of our accounts, such as the players whose
+    /// collectors reported the match. Friends get a short line; everyone else
+    /// gets their rank, games and win rate on their hero, recent form, and a
+    /// stack tag when they keep queuing with someone on their team.
     pub(crate) async fn scout(
         &self,
         live: &ActiveMatch,
@@ -303,10 +336,17 @@ impl LiveScout {
         friends: &[u32],
     ) -> CreateEmbed {
         let names = self.names().await;
+        let is_friend =
+            |account_id: u32| linked.contains_key(&account_id) || friends.contains(&account_id);
         let account_ids = live
             .players
             .iter()
             .filter_map(|player| player.account_id)
+            .collect::<Vec<_>>();
+        let strangers = account_ids
+            .iter()
+            .copied()
+            .filter(|account_id| !is_friend(*account_id))
             .collect::<Vec<_>>();
         let profiles = get_json::<Vec<SteamProfile>>(
             &self.http,
@@ -321,15 +361,22 @@ impl LiveScout {
                 .collect::<HashMap<_, _>>()
         })
         .unwrap_or_default();
+        let hero_stats = if strangers.is_empty() {
+            HashMap::new()
+        } else {
+            get_json::<Vec<HeroStat>>(
+                &self.http,
+                &self.base_url,
+                &format!("v1/players/hero-stats?account_ids={}", join_ids(&strangers)),
+            )
+            .await
+            .map(index_hero_stats)
+            .unwrap_or_default()
+        };
 
         let semaphore = Arc::new(Semaphore::new(LOOKUP_CONCURRENCY));
         let mut lookups = JoinSet::new();
-        for (index, player) in live.players.iter().enumerate() {
-            let (Some(account_id), hero_id) =
-                (player.account_id, player.hero_id.unwrap_or_default())
-            else {
-                continue;
-            };
+        for account_id in strangers {
             let (http, base_url, semaphore) = (
                 self.http.clone(),
                 Arc::clone(&self.base_url),
@@ -346,24 +393,32 @@ impl LiveScout {
                     &format!("v1/players/{account_id}/match-history"),
                 )
                 .await;
-                let badge = rank.ok().and_then(|rank| rank.badge);
                 (
-                    index,
-                    badge,
-                    history
-                        .ok()
-                        .map(|history| summarize_history(&history, hero_id)),
+                    account_id,
+                    rank.ok().and_then(|rank| rank.badge),
+                    history.ok(),
                 )
             });
         }
-        let mut results = HashMap::new();
-        while let Some(Ok((index, badge, summary))) = lookups.join_next().await {
-            results.insert(index, (badge, summary));
+        let mut badges = HashMap::new();
+        let mut histories = HashMap::new();
+        while let Some(Ok((account_id, badge, history))) = lookups.join_next().await {
+            badges.insert(account_id, badge);
+            if let Some(history) = history {
+                histories.insert(account_id, history);
+            }
         }
+        let teams = live
+            .players
+            .iter()
+            .filter_map(|player| Some((player.account_id?, player.team?)))
+            .filter(|(account_id, _)| histories.contains_key(account_id))
+            .collect::<Vec<_>>();
+        let stacks = find_stacks(&teams, &histories);
 
         let mut lines: [Vec<String>; 2] = [Vec::new(), Vec::new()];
         let mut friend_teams = [false, false];
-        for (index, player) in live.players.iter().enumerate() {
+        for player in &live.players {
             let Some(team) = player
                 .team
                 .and_then(|team| usize::try_from(team).ok())
@@ -371,37 +426,37 @@ impl LiveScout {
             else {
                 continue;
             };
-            let discord_user = player
-                .account_id
-                .and_then(|account_id| linked.get(&account_id).copied());
-            friend_teams[team] |= discord_user.is_some()
-                || player
-                    .account_id
-                    .is_some_and(|account_id| friends.contains(&account_id));
-            let (badge, summary) = results.remove(&index).unwrap_or((None, None));
+            let account_id = player.account_id.unwrap_or_default();
+            let friend = account_id != 0 && is_friend(account_id);
+            friend_teams[team] |= friend;
             let hero_id = player.hero_id.unwrap_or_default();
-            let hero = names
-                .0
-                .get(&hero_id)
-                .cloned()
-                .unwrap_or_else(|| format!("Hero {hero_id}"));
-            let name = player
-                .account_id
-                .and_then(|account_id| profiles.get(&account_id))
-                .map(String::as_str)
-                .unwrap_or("Unknown player");
-            let rank = badge
-                .map(|badge| rank_label(badge, &names.1))
-                .unwrap_or_else(|| "Unknown rank".into());
-            lines[team].push(player_line(
-                name,
-                &hero,
-                &rank,
-                summary.as_ref(),
-                discord_user,
-            ));
+            let card = PlayerCard {
+                name: profiles
+                    .get(&account_id)
+                    .cloned()
+                    .unwrap_or_else(|| "Unknown player".into()),
+                hero: names
+                    .0
+                    .get(&hero_id)
+                    .cloned()
+                    .unwrap_or_else(|| format!("Hero {hero_id}")),
+                discord_user: linked.get(&account_id).copied(),
+                friend,
+                rank: badges
+                    .get(&account_id)
+                    .copied()
+                    .flatten()
+                    .map(|badge| rank_label(badge, &names.1))
+                    .unwrap_or_else(|| "Unknown rank".into()),
+                hero_games: hero_stats.get(&(account_id, hero_id)).copied(),
+                summary: histories
+                    .get(&account_id)
+                    .map(|history| summarize_history(history, hero_id)),
+                stack: stacks.get(&account_id).copied(),
+            };
+            lines[team].push(player_line(&card));
         }
-        live_embed(live, &lines, friend_teams)
+        live_embed(live, &lines, friend_teams, !stacks.is_empty())
     }
 }
 
@@ -521,37 +576,134 @@ pub(crate) fn escape_markdown(text: &str) -> String {
         .collect()
 }
 
-pub(crate) fn player_line(
-    name: &str,
-    hero: &str,
-    rank: &str,
-    summary: Option<&Summary>,
-    discord_user: Option<u64>,
-) -> String {
-    let who = discord_user
+/// One player's line. Friends only get their hero and name; for everyone else
+/// the line shows rank, games and win rate on the hero, recent W-L, and a
+/// stack tag.
+pub(crate) fn player_line(card: &PlayerCard) -> String {
+    let who = card
+        .discord_user
         .map(|user| format!("<@{user}>"))
-        .unwrap_or_else(|| escape_markdown(name));
-    let mut line = format!("**{hero}** · {who} · {rank}");
-    let Some(summary) = summary.filter(|summary| summary.recent > 0) else {
-        line.push_str(" · no public match history");
+        .unwrap_or_else(|| escape_markdown(&card.name));
+    let mut line = format!("**{}** · {who}", card.hero);
+    if card.friend {
         return line;
-    };
-    line.push_str(&format!(
-        " · {}-{} last {} · {:.1} KDA",
-        summary.wins,
-        summary.recent - summary.wins,
-        summary.recent,
-        summary.kda
-    ));
-    match summary.hero_win_rate {
-        Some(rate) => line.push_str(&format!(
-            " · {} on hero ({:.0}%)",
-            summary.hero_matches,
-            rate * 100.0
+    }
+    line.push_str(&format!(" · {}", card.rank));
+    // Whole-history hero stats when the API has them, else the match history.
+    let hero_games = card.hero_games.or_else(|| {
+        let summary = card.summary.as_ref()?;
+        let rate = summary.hero_win_rate?;
+        let games = u32::try_from(summary.hero_matches).ok()?;
+        Some((games, (rate * f64::from(games)).round() as u32))
+    });
+    match hero_games {
+        Some((games, wins)) if games > 0 => line.push_str(&format!(
+            " · {games} {} on hero ({:.0}%)",
+            if games == 1 { "game" } else { "games" },
+            f64::from(wins) * 100.0 / f64::from(games)
         )),
-        None => line.push_str(" · first time on hero"),
+        _ if card
+            .summary
+            .as_ref()
+            .is_some_and(|summary| summary.recent > 0) =>
+        {
+            line.push_str(" · first game on hero");
+        }
+        _ => {}
+    }
+    match card.summary.as_ref().filter(|summary| summary.recent > 0) {
+        Some(summary) => line.push_str(&format!(
+            " · {}-{} last {}",
+            summary.wins,
+            summary.recent - summary.wins,
+            summary.recent
+        )),
+        None => line.push_str(" · no public match history"),
+    }
+    if let Some(stack) = card.stack {
+        line.push_str(&format!(" · 🔗 stack {stack}"));
     }
     line
+}
+
+fn index_hero_stats(stats: Vec<HeroStat>) -> HashMap<(u32, u32), (u32, u32)> {
+    stats
+        .into_iter()
+        .map(|stat| {
+            (
+                (stat.account_id, stat.hero_id),
+                (stat.matches_played, stat.wins),
+            )
+        })
+        .collect()
+}
+
+/// Groups teammates who were on the same team in at least
+/// `STACK_MIN_SHARED` of their last `STACK_WINDOW` games, which in practice
+/// means they queue together. `players` pairs account IDs with their team in
+/// this match. Returns a letter per stacked player (A, B, ...).
+pub(crate) fn find_stacks(
+    players: &[(u32, i32)],
+    histories: &HashMap<u32, Vec<HistoryEntry>>,
+) -> HashMap<u32, char> {
+    let recent = |account_id: u32| -> HashMap<u64, Option<i32>> {
+        histories
+            .get(&account_id)
+            .map(|history| {
+                history
+                    .iter()
+                    .take(STACK_WINDOW)
+                    .filter_map(|entry| Some((entry.match_id?, entry.player_team)))
+                    .collect()
+            })
+            .unwrap_or_default()
+    };
+    let games = players
+        .iter()
+        .map(|(account_id, _)| recent(*account_id))
+        .collect::<Vec<_>>();
+    // Union-find over the players' indexes.
+    let mut parent = (0..players.len()).collect::<Vec<_>>();
+    fn root(parent: &mut [usize], mut index: usize) -> usize {
+        while parent[index] != index {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        index
+    }
+    for left in 0..players.len() {
+        for right in left + 1..players.len() {
+            if players[left].1 != players[right].1 {
+                continue;
+            }
+            let shared = games[left]
+                .iter()
+                .filter(|(match_id, team)| {
+                    team.is_some() && games[right].get(match_id) == Some(team)
+                })
+                .count();
+            if shared >= STACK_MIN_SHARED {
+                let (a, b) = (root(&mut parent, left), root(&mut parent, right));
+                parent[b] = a;
+            }
+        }
+    }
+    let mut sizes = HashMap::new();
+    for index in 0..players.len() {
+        *sizes.entry(root(&mut parent, index)).or_insert(0) += 1;
+    }
+    let mut letters = HashMap::new();
+    let mut stacks = HashMap::new();
+    for (index, (account_id, _)) in players.iter().enumerate() {
+        let group = root(&mut parent, index);
+        if sizes[&group] < 2 {
+            continue;
+        }
+        let next = char::from(b'A' + u8::try_from(letters.len()).unwrap_or(25).min(25));
+        let letter = *letters.entry(group).or_insert(next);
+        stacks.insert(*account_id, letter);
+    }
+    stacks
 }
 
 /// Field name and value pairs, the linked players' team first.
@@ -622,6 +774,7 @@ fn live_embed(
     live: &ActiveMatch,
     lines: &[Vec<String>; 2],
     friend_teams: [bool; 2],
+    has_stacks: bool,
 ) -> CreateEmbed {
     let started = live
         .start_time
@@ -634,9 +787,14 @@ fn live_embed(
     for (name, value) in live_fields(lines, friend_teams) {
         embed = embed.field(name, value, false);
     }
-    embed.footer(CreateEmbedFooter::new(
-        "Live data from the community-run Deadlock API · ranks and form are public history",
-    ))
+    let stacks = if has_stacks {
+        " · 🔗 same letter = on the same team in 2+ of their last 30 games"
+    } else {
+        ""
+    };
+    embed.footer(CreateEmbedFooter::new(format!(
+        "Live data from the community-run Deadlock API{stacks}"
+    )))
 }
 
 #[cfg(test)]
@@ -645,6 +803,7 @@ mod tests {
 
     fn entry(won_match: bool, hero_id: u32, kills: u32, deaths: u32, assists: u32) -> HistoryEntry {
         HistoryEntry {
+            match_id: None,
             hero_id: Some(hero_id),
             player_kills: Some(kills),
             player_deaths: Some(deaths),
@@ -746,18 +905,89 @@ mod tests {
     }
 
     #[test]
-    fn player_line_handles_friends_new_heroes_and_private_history() {
+    fn player_line_shows_hero_games_form_and_stack() {
         let summary = summarize_history(&[entry(true, 20, 5, 5, 5), entry(false, 20, 5, 5, 5)], 10);
-
+        let card = PlayerCard {
+            name: "J~".into(),
+            hero: "Haze".into(),
+            rank: "Oracle 1".into(),
+            hero_games: Some((34, 19)),
+            summary: Some(summary.clone()),
+            stack: Some('A'),
+            ..PlayerCard::default()
+        };
         assert_eq!(
-            player_line("J~", "Haze", "Oracle 1", Some(&summary), None),
-            "**Haze** · J\\~ · Oracle 1 · 1-1 last 2 · 2.0 KDA · first time on hero"
+            player_line(&card),
+            "**Haze** · J\\~ · Oracle 1 · 34 games on hero (56%) · 1-1 last 2 · 🔗 stack A"
         );
-        assert!(player_line("x", "Haze", "Unranked", Some(&summary), Some(7)).contains("<@7>"));
+
+        let new_hero = PlayerCard {
+            hero_games: None,
+            stack: None,
+            ..card.clone()
+        };
         assert_eq!(
-            player_line("a_b", "Haze", "Unranked", None, None),
+            player_line(&new_hero),
+            "**Haze** · J\\~ · Oracle 1 · first game on hero · 1-1 last 2"
+        );
+
+        let private = PlayerCard {
+            name: "a_b".into(),
+            rank: "Unranked".into(),
+            ..PlayerCard::default()
+        };
+        assert_eq!(
+            player_line(&PlayerCard {
+                hero: "Haze".into(),
+                ..private
+            }),
             "**Haze** · a\\_b · Unranked · no public match history"
         );
+    }
+
+    #[test]
+    fn friends_get_a_short_line() {
+        let card = PlayerCard {
+            name: "max".into(),
+            hero: "Vyper".into(),
+            discord_user: Some(7),
+            friend: true,
+            rank: "Oracle 4".into(),
+            hero_games: Some((50, 30)),
+            ..PlayerCard::default()
+        };
+        assert_eq!(player_line(&card), "**Vyper** · <@7>");
+    }
+
+    #[test]
+    fn stacks_are_teammates_who_keep_sharing_games() {
+        let game = |match_id: u64, team: i32| HistoryEntry {
+            match_id: Some(match_id),
+            player_team: Some(team),
+            ..HistoryEntry::default()
+        };
+        let histories = HashMap::from([
+            // 1 and 2 shared two games on the same team: a stack.
+            (1, vec![game(10, 0), game(11, 1), game(12, 0)]),
+            (2, vec![game(10, 0), game(11, 1), game(13, 1)]),
+            // 3 met 1 once, and 4 was against 1 in game 12: no stack.
+            (3, vec![game(10, 0), game(20, 0)]),
+            (4, vec![game(12, 1), game(10, 1)]),
+            // 5 and 6 are on the other team and share three games.
+            (5, vec![game(30, 0), game(31, 0), game(32, 1)]),
+            (6, vec![game(30, 0), game(31, 0), game(32, 1)]),
+            // 7 shares games with 1 but is on the other team in this match.
+            (7, vec![game(10, 0), game(11, 1)]),
+        ]);
+        let players = [(1, 0), (2, 0), (3, 0), (4, 0), (5, 1), (6, 1), (7, 1)];
+
+        let stacks = find_stacks(&players, &histories);
+
+        assert_eq!(stacks.get(&1), Some(&'A'));
+        assert_eq!(stacks.get(&2), Some(&'A'));
+        assert_eq!(stacks.get(&5), Some(&'B'));
+        assert_eq!(stacks.get(&6), Some(&'B'));
+        assert_eq!(stacks.len(), 4);
     }
 
     #[test]
