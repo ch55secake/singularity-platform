@@ -459,7 +459,7 @@ impl ClickHouseClient {
             "SELECT count() FROM {}.match_processed_events FINAL WHERE match_id = {}",
             self.config.database, match_id
         );
-        let mut request = self.http.post(&self.config.url).query(&[("query", query)]);
+        let mut request = self.http.post(&self.config.url).body(query);
         if let Some(user) = &self.config.user {
             request = request.basic_auth(user, self.config.password.as_deref());
         }
