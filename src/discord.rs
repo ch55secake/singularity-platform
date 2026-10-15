@@ -447,7 +447,9 @@ impl Service {
         let account_id = parse_account_id(&input).ok_or_else(|| {
             ApiError("That is not a supported Steam profile or account ID.".into())
         })?;
-        self.api.get_player(account_id, Some(1)).await?;
+        // Linking doesn't need a tracked match: a new player has none until a
+        // collector sends their first one. Only the reply depends on it.
+        let tracked = self.api.get_player(account_id, Some(1)).await.is_ok();
         let user_id = command.user.id.get().to_string();
         let linked = LinkedAccount {
             account_id,
@@ -460,9 +462,14 @@ impl Service {
             .save()
             .await
             .map_err(|_| ApiError("The bot could not save your account link.".into()))?;
-        Ok(Reply::Text(
-            "Your Steam account is linked. Account IDs are kept private by the bot.".to_string(),
-        ))
+        let note = if tracked {
+            ""
+        } else {
+            " Singularity has no matches for you yet; they appear after your next match with the collector running."
+        };
+        Ok(Reply::Text(format!(
+            "Your Steam account is linked. Account IDs are kept private by the bot.{note}"
+        )))
     }
 
     async fn handle_last(
