@@ -325,6 +325,7 @@ pub(crate) async fn fetch_salts(state: AppState) {
             continue;
         };
         not_before = now + MIN_REQUEST_GAP_SECONDS;
+        info!(match_id, "asking the community API for salts");
         match request_salts(&http, &base_url, match_id).await {
             Ok(Some(record)) => {
                 let stored = store_records(&state, vec![record]).await;
@@ -336,8 +337,16 @@ pub(crate) async fn fetch_salts(state: AppState) {
                     Err(_) => warn!(match_id, "could not store fetched salts"),
                 }
             }
-            Ok(None) => retry_later(&state, match_id, now).await,
+            Ok(None) => {
+                info!(match_id, "community API has no salts yet; will retry");
+                retry_later(&state, match_id, now).await;
+            }
             Err(RequestError::Busy(wait)) => {
+                warn!(
+                    match_id,
+                    retry_after_seconds = wait,
+                    "community API says Steam is busy; waiting before the next salt request"
+                );
                 not_before = now + wait.max(MIN_REQUEST_GAP_SECONDS);
                 retry_later(&state, match_id, now).await;
             }
