@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, BTreeSet, HashSet},
     env,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -25,7 +25,7 @@ const DEFAULT_OUTPUT_DIR: &str = "data/metadata";
 const DEFAULT_PARSE_STATE: &str = "data/metadata-parse-state.json";
 const DEFAULT_CLICKHOUSE_DATABASE: &str = "singularity";
 const DEFAULT_TIMEOUT_SECONDS: u64 = 30;
-const PARSE_STATE_VERSION: u32 = 2;
+const PARSE_STATE_VERSION: u32 = 3;
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 struct MatchRow {
@@ -211,12 +211,18 @@ struct ParseStateFile {
     processed: BTreeMap<String, u64>,
     #[serde(default)]
     public_ids: BTreeMap<u64, String>,
+    #[serde(default)]
+    reprocess_existing_matches: bool,
+    #[serde(default)]
+    reprocessed_matches: BTreeSet<u64>,
 }
 
 struct ParseState {
     path: PathBuf,
     processed: BTreeMap<String, u64>,
     public_ids: BTreeMap<u64, String>,
+    reprocess_existing_matches: bool,
+    reprocessed_matches: BTreeSet<u64>,
 }
 
 struct ClickHouseConfig {
@@ -245,6 +251,8 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let mut state = ParseState::load(&state_path).await?;
     let mut entries = fs::read_dir(&output_dir).await?;
     let mut parsed_count = 0;
+    let mut duplicate_count = 0;
+    let mut processed_match_ids = HashSet::new();
 
     while let Some(entry) = entries.next_entry().await? {
         let path = entry.path();
@@ -258,7 +266,32 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
             continue;
         }
         let bytes = fs::read(&path).await?;
-        let mut parsed = parse_metadata(&bytes)?;
+        let contents = decode_metadata(&bytes)?;
+        let match_id = metadata_match_id(&contents)?;
+        let data_version = metadata_version(&bytes);
+        let check_clickhouse = !processed_match_ids.contains(&match_id)
+            && !state.reprocessed_matches.contains(&match_id)
+            && !state.reprocess_existing_matches;
+        let exists_in_clickhouse = if check_clickhouse {
+            clickhouse.match_is_processed(match_id).await?
+        } else {
+            false
+        };
+        let already_processed = should_skip_duplicate_match(
+            match_id,
+            &processed_match_ids,
+            &state.reprocessed_matches,
+            exists_in_clickhouse,
+            state.reprocess_existing_matches,
+        );
+        if already_processed {
+            state.processed.insert(job_id.to_string(), data_version);
+            state.save().await?;
+            processed_match_ids.insert(match_id);
+            duplicate_count += 1;
+            continue;
+        }
+        let mut parsed = parse_decoded_metadata(contents, data_version)?;
         let public_id = match state.public_ids.entry(parsed.match_row.match_id) {
             std::collections::btree_map::Entry::Occupied(entry) => entry.get().clone(),
             std::collections::btree_map::Entry::Vacant(entry) => {
@@ -321,12 +354,18 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         state
             .processed
             .insert(job_id.to_string(), parsed.match_row.metadata_version);
+        processed_match_ids.insert(match_id);
+        if state.reprocess_existing_matches {
+            state.reprocessed_matches.insert(match_id);
+        }
         state.save().await?;
         parsed_count += 1;
     }
 
+    state.reprocess_existing_matches = false;
+    state.reprocessed_matches.clear();
     state.save().await?;
-    println!("metadata parser: processed={parsed_count}");
+    println!("metadata parser: processed={parsed_count} duplicates={duplicate_count}");
     Ok(())
 }
 
@@ -414,6 +453,35 @@ impl ClickHouseClient {
         }
         Ok(())
     }
+
+    async fn match_is_processed(&self, match_id: u64) -> Result<bool, Box<dyn std::error::Error>> {
+        let query = format!(
+            "SELECT count() FROM {}.match_processed_events FINAL WHERE match_id = {}",
+            self.config.database, match_id
+        );
+        let mut request = self.http.post(&self.config.url).query(&[("query", query)]);
+        if let Some(user) = &self.config.user {
+            request = request.basic_auth(user, self.config.password.as_deref());
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(std::io::Error::other("ClickHouse duplicate check failed").into());
+        }
+        let count = response.text().await?.trim().parse::<u64>()?;
+        Ok(count > 0)
+    }
+}
+
+fn should_skip_duplicate_match(
+    match_id: u64,
+    processed_this_run: &HashSet<u64>,
+    reprocessed_matches: &BTreeSet<u64>,
+    exists_in_clickhouse: bool,
+    reprocess_existing_matches: bool,
+) -> bool {
+    processed_this_run.contains(&match_id)
+        || reprocessed_matches.contains(&match_id)
+        || (exists_in_clickhouse && !reprocess_existing_matches)
 }
 
 impl ParseState {
@@ -428,14 +496,21 @@ impl ParseState {
                 path: path.to_path_buf(),
                 processed: BTreeMap::new(),
                 public_ids: BTreeMap::new(),
+                reprocess_existing_matches: false,
+                reprocessed_matches: BTreeSet::new(),
             });
         }
         #[cfg(unix)]
         fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
         let file: ParseStateFile = serde_json::from_slice(&contents)?;
-        let processed = match file.version {
-            1 => BTreeMap::new(),
-            PARSE_STATE_VERSION => file.processed,
+        let (processed, reprocess_existing_matches, reprocessed_matches) = match file.version {
+            1 => (BTreeMap::new(), true, BTreeSet::new()),
+            2 => (file.processed, false, BTreeSet::new()),
+            PARSE_STATE_VERSION => (
+                file.processed,
+                file.reprocess_existing_matches,
+                file.reprocessed_matches,
+            ),
             _ => {
                 return Err(std::io::Error::new(
                     std::io::ErrorKind::InvalidData,
@@ -448,6 +523,8 @@ impl ParseState {
             path: path.to_path_buf(),
             processed,
             public_ids: file.public_ids,
+            reprocess_existing_matches,
+            reprocessed_matches,
         })
     }
 
@@ -463,6 +540,8 @@ impl ParseState {
             version: PARSE_STATE_VERSION,
             processed: self.processed.clone(),
             public_ids: self.public_ids.clone(),
+            reprocess_existing_matches: self.reprocess_existing_matches,
+            reprocessed_matches: self.reprocessed_matches.clone(),
         })?;
         let temp_path = self.path.with_file_name(format!(
             ".{}.tmp-{}",
@@ -489,10 +568,31 @@ impl ParseState {
     }
 }
 
+#[cfg(test)]
 fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
-    let contents = decode_contents(bytes).ok_or_else(|| {
+    parse_decoded_metadata(decode_metadata(bytes)?, metadata_version(bytes))
+}
+
+fn decode_metadata(bytes: &[u8]) -> Result<CMsgMatchMetaDataContents, std::io::Error> {
+    decode_contents(bytes).ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "invalid metadata protobuf")
-    })?;
+    })
+}
+
+fn metadata_match_id(contents: &CMsgMatchMetaDataContents) -> Result<u64, std::io::Error> {
+    contents
+        .match_info
+        .as_ref()
+        .and_then(|info| info.match_id)
+        .ok_or_else(|| {
+            std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata has no match id")
+        })
+}
+
+fn parse_decoded_metadata(
+    contents: CMsgMatchMetaDataContents,
+    metadata_version: u64,
+) -> Result<ParsedMatch, std::io::Error> {
     let info = contents.match_info.ok_or_else(|| {
         std::io::Error::new(
             std::io::ErrorKind::InvalidData,
@@ -502,7 +602,6 @@ fn parse_metadata(bytes: &[u8]) -> Result<ParsedMatch, std::io::Error> {
     let match_id = info.match_id.ok_or_else(|| {
         std::io::Error::new(std::io::ErrorKind::InvalidData, "metadata has no match id")
     })?;
-    let metadata_version = metadata_version(bytes);
     let match_row = MatchRow {
         match_id,
         public_id: String::new(),
@@ -941,6 +1040,52 @@ mod tests {
             version: 1,
             processed: BTreeMap::from([("processed-job".to_string(), 42)]),
             public_ids: BTreeMap::from([(42, "public-match-id".to_string())]),
+            reprocess_existing_matches: false,
+            reprocessed_matches: BTreeSet::new(),
+        };
+        fs::write(&path, serde_json::to_vec(&previous).unwrap())
+            .await
+            .unwrap();
+
+        let mut state = ParseState::load(&path).await.unwrap();
+
+        assert!(state.processed.is_empty());
+        assert!(state.reprocess_existing_matches);
+        assert!(state.reprocessed_matches.is_empty());
+        assert_eq!(
+            state.public_ids.get(&42).map(String::as_str),
+            Some("public-match-id")
+        );
+        state.reprocessed_matches.insert(43);
+        state.save().await.unwrap();
+        let saved: ParseStateFile =
+            serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
+        assert_eq!(saved.version, PARSE_STATE_VERSION);
+        assert!(saved.processed.is_empty());
+        assert!(saved.reprocess_existing_matches);
+        assert!(saved.reprocessed_matches.contains(&43));
+        let resumed = ParseState::load(&path).await.unwrap();
+        assert!(resumed.reprocess_existing_matches);
+        assert!(resumed.reprocessed_matches.contains(&43));
+        fs::remove_file(path).await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn migrates_current_parse_state_without_forcing_a_reparse() {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "singularity-parser-state-v2-{}-{nonce}.json",
+            std::process::id()
+        ));
+        let previous = ParseStateFile {
+            version: 2,
+            processed: BTreeMap::from([("processed-job".to_string(), 42)]),
+            public_ids: BTreeMap::from([(42, "public-match-id".to_string())]),
+            reprocess_existing_matches: false,
+            reprocessed_matches: BTreeSet::new(),
         };
         fs::write(&path, serde_json::to_vec(&previous).unwrap())
             .await
@@ -948,17 +1093,52 @@ mod tests {
 
         let state = ParseState::load(&path).await.unwrap();
 
-        assert!(state.processed.is_empty());
-        assert_eq!(
-            state.public_ids.get(&42).map(String::as_str),
-            Some("public-match-id")
-        );
-        state.save().await.unwrap();
-        let saved: ParseStateFile =
-            serde_json::from_slice(&fs::read(&path).await.unwrap()).unwrap();
-        assert_eq!(saved.version, PARSE_STATE_VERSION);
-        assert!(saved.processed.is_empty());
+        assert_eq!(state.processed.get("processed-job"), Some(&42));
+        assert!(!state.reprocess_existing_matches);
+        assert!(state.reprocessed_matches.is_empty());
         fs::remove_file(path).await.unwrap();
+    }
+
+    #[test]
+    fn skips_processed_matches_but_allows_the_one_time_backfill() {
+        let processed_this_run = HashSet::new();
+        let no_backfill_matches = BTreeSet::new();
+
+        assert!(should_skip_duplicate_match(
+            42,
+            &HashSet::from([42]),
+            &no_backfill_matches,
+            false,
+            true,
+        ));
+        assert!(should_skip_duplicate_match(
+            42,
+            &processed_this_run,
+            &no_backfill_matches,
+            true,
+            false,
+        ));
+        assert!(!should_skip_duplicate_match(
+            42,
+            &processed_this_run,
+            &no_backfill_matches,
+            true,
+            true,
+        ));
+        assert!(!should_skip_duplicate_match(
+            42,
+            &processed_this_run,
+            &no_backfill_matches,
+            false,
+            false,
+        ));
+        assert!(should_skip_duplicate_match(
+            42,
+            &processed_this_run,
+            &BTreeSet::from([42]),
+            false,
+            true,
+        ));
     }
 
     #[test]
