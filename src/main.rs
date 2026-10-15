@@ -3,6 +3,7 @@
 
 mod assets;
 mod discord;
+mod discord_live;
 mod metadata;
 mod parser;
 mod read_api;

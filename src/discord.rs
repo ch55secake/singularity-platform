@@ -1,5 +1,5 @@
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashMap},
     env,
     fmt::{self, Display},
     path::{Path, PathBuf},
@@ -29,6 +29,8 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::discord_live::LiveScout;
+
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080/api";
 const DEFAULT_WEB_URL: &str = "http://127.0.0.1";
 const DEFAULT_POLL_SECONDS: u64 = 60;
@@ -37,6 +39,8 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 15;
 const MAX_STATS_MATCHES: u32 = 100;
 const EVENT_PAGE_LIMIT: usize = 100;
 const STEAM64_BASE: u64 = 76561197960265728;
+// Live match IDs remembered so each live match is posted once.
+const LIVE_POSTED_LIMIT: usize = 200;
 
 #[derive(Debug)]
 struct Config {
@@ -144,6 +148,8 @@ struct StateFile {
     last_match_id: u64,
     #[serde(default)]
     links: BTreeMap<String, LinkedAccount>,
+    #[serde(default)]
+    live_posted: Vec<u64>,
 }
 
 struct State {
@@ -154,6 +160,7 @@ struct State {
 struct Service {
     config: Arc<Config>,
     api: ApiClient,
+    live: Option<LiveScout>,
     state: Arc<Mutex<State>>,
     http: Arc<Mutex<Option<Arc<Http>>>>,
 }
@@ -177,9 +184,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::from_env()?);
     let state = Arc::new(Mutex::new(State::load(&config.state_path).await?));
     let api = ApiClient::from_config(&config)?;
+    let live = LiveScout::from_env(api.http.clone())?;
     let service = Arc::new(Service {
         config: Arc::clone(&config),
         api,
+        live,
         state,
         http: Arc::new(Mutex::new(None)),
     });
@@ -191,8 +200,11 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
     let poll_service = Arc::clone(&service);
     let poll_task = tokio::spawn(async move { poll_notifications(poll_service).await });
+    let live_service = Arc::clone(&service);
+    let live_task = tokio::spawn(async move { poll_live_matches(live_service).await });
     let result = client.start().await;
     poll_task.abort();
+    live_task.abort();
     result?;
     Ok(())
 }
@@ -741,7 +753,76 @@ async fn poll_notifications(service: Arc<Service>) {
     }
 }
 
+async fn poll_live_matches(service: Arc<Service>) {
+    let Some(live) = service.live.as_ref() else {
+        return;
+    };
+    info!(
+        interval_seconds = live.poll_interval.as_secs(),
+        "Discord live match posts enabled"
+    );
+    let mut ticker = interval(live.poll_interval);
+    loop {
+        ticker.tick().await;
+        if let Err(error) = service.poll_live_once(live).await {
+            warn!(%error, "Discord live match poll failed");
+        }
+    }
+}
+
 impl Service {
+    async fn poll_live_once(&self, live: &LiveScout) -> Result<(), Box<dyn std::error::Error>> {
+        let Some(http) = self.http.lock().await.clone() else {
+            return Ok(());
+        };
+        let linked = {
+            let state = self.state.lock().await;
+            state
+                .file
+                .links
+                .iter()
+                .filter_map(|(user_id, link)| Some((link.account_id, user_id.parse::<u64>().ok()?)))
+                .collect::<HashMap<_, _>>()
+        };
+        if linked.is_empty() {
+            return Ok(());
+        }
+        let account_ids = linked.keys().copied().collect::<Vec<_>>();
+        let matches = live
+            .active_matches(&account_ids)
+            .await
+            .map_err(|error| error.to_string())?;
+        for active in matches {
+            let has_linked = active
+                .players
+                .iter()
+                .any(|player| player.account_id.is_some_and(|id| linked.contains_key(&id)));
+            let posted = self
+                .state
+                .lock()
+                .await
+                .file
+                .live_posted
+                .contains(&active.match_id);
+            if !has_linked || posted {
+                continue;
+            }
+            let embed = live.scout(&active, &linked).await;
+            self.service_send_message(&http, CreateMessage::new().embed(embed))
+                .await?;
+            let mut state = self.state.lock().await;
+            state.file.live_posted.push(active.match_id);
+            let excess = state
+                .file
+                .live_posted
+                .len()
+                .saturating_sub(LIVE_POSTED_LIMIT);
+            state.file.live_posted.drain(..excess);
+            state.save().await?;
+        }
+        Ok(())
+    }
+
     async fn poll_once(&self) -> Result<(), Box<dyn std::error::Error>> {
         let Some(http) = self.http.lock().await.clone() else {
             return Ok(());
@@ -997,6 +1078,7 @@ fn empty_state() -> StateFile {
         last_start_time: 0,
         last_match_id: 0,
         links: BTreeMap::new(),
+        live_posted: Vec::new(),
     }
 }
 

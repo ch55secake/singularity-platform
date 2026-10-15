@@ -1,0 +1,608 @@
+//! Live match scouting for the Discord bot.
+//!
+//! When a linked player is in a live match, the bot posts both teams with each
+//! player's rank, recent form and experience on their hero. Live matches come
+//! from the community Deadlock API's active-match feed, which mirrors the
+//! in-game watch tab and only lists about the top 200 matches being played.
+
+use std::{
+    collections::HashMap,
+    env,
+    sync::Arc,
+    time::{Duration, Instant},
+};
+
+use reqwest::Client as HttpClient;
+use serde::{Deserialize, de::DeserializeOwned};
+use serenity::all::{CreateEmbed, CreateEmbedFooter};
+use tokio::{
+    sync::{Mutex, Semaphore},
+    task::JoinSet,
+};
+
+const DEFAULT_DEADLOCK_API_URL: &str = "https://api.deadlock-api.com";
+const DEFAULT_LIVE_POLL_SECONDS: u64 = 120;
+const RECENT_MATCHES: usize = 20;
+const LOOKUP_CONCURRENCY: usize = 6;
+const NAMES_TTL: Duration = Duration::from_secs(24 * 60 * 60);
+const FIELD_LIMIT: usize = 1024;
+const TEAM_NAMES: [&str; 2] = ["Amber Hand", "Sapphire Flame"];
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct ActiveMatch {
+    pub(crate) match_id: u64,
+    #[serde(default)]
+    start_time: Option<u64>,
+    #[serde(default)]
+    match_mode_parsed: Option<String>,
+    #[serde(default)]
+    region_mode_parsed: Option<String>,
+    #[serde(default)]
+    pub(crate) players: Vec<ActivePlayer>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct ActivePlayer {
+    #[serde(default)]
+    pub(crate) account_id: Option<u32>,
+    #[serde(default)]
+    team: Option<i32>,
+    #[serde(default)]
+    hero_id: Option<u32>,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct HistoryEntry {
+    #[serde(default)]
+    hero_id: Option<u32>,
+    #[serde(default)]
+    player_kills: Option<u32>,
+    #[serde(default)]
+    player_deaths: Option<u32>,
+    #[serde(default)]
+    player_assists: Option<u32>,
+    #[serde(default)]
+    match_result: Option<i32>,
+    #[serde(default)]
+    player_team: Option<i32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct Rank {
+    #[serde(default)]
+    badge: Option<u32>,
+}
+
+#[derive(Debug, Deserialize)]
+struct SteamProfile {
+    account_id: u32,
+    #[serde(default)]
+    personaname: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct NamedAsset {
+    #[serde(default, alias = "tier")]
+    id: Option<u32>,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub(crate) struct Summary {
+    recent: usize,
+    wins: usize,
+    kda: f64,
+    hero_matches: usize,
+    hero_win_rate: Option<f64>,
+}
+
+type Names = (HashMap<u32, String>, HashMap<u32, String>);
+
+/// Client for the community API calls behind a live match post.
+pub(crate) struct LiveScout {
+    http: HttpClient,
+    base_url: Arc<str>,
+    pub(crate) poll_interval: Duration,
+    names: Mutex<Option<(Instant, Arc<Names>)>>,
+}
+
+impl LiveScout {
+    /// Reads SINGULARITY_DISCORD_LIVE_MATCHES (default on),
+    /// SINGULARITY_DISCORD_DEADLOCK_API_URL and
+    /// SINGULARITY_DISCORD_LIVE_POLL_SECONDS. Returns None when turned off.
+    pub(crate) fn from_env(http: HttpClient) -> Result<Option<Self>, std::io::Error> {
+        let enabled = env::var("SINGULARITY_DISCORD_LIVE_MATCHES")
+            .map(|value| !matches!(value.trim(), "0" | "false" | "no" | "off"))
+            .unwrap_or(true);
+        if !enabled {
+            return Ok(None);
+        }
+        let poll_seconds = env::var("SINGULARITY_DISCORD_LIVE_POLL_SECONDS")
+            .unwrap_or_else(|_| DEFAULT_LIVE_POLL_SECONDS.to_string())
+            .parse::<u64>()
+            .ok()
+            .filter(|seconds| *seconds > 0)
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "invalid live poll interval",
+                )
+            })?;
+        let base_url = env::var("SINGULARITY_DISCORD_DEADLOCK_API_URL")
+            .unwrap_or_else(|_| DEFAULT_DEADLOCK_API_URL.to_string());
+        Ok(Some(Self {
+            http,
+            base_url: base_url.trim_end_matches('/').into(),
+            poll_interval: Duration::from_secs(poll_seconds),
+            names: Mutex::new(None),
+        }))
+    }
+
+    pub(crate) async fn active_matches(&self, account_ids: &[u32]) -> LiveResult<Vec<ActiveMatch>> {
+        get_json(
+            &self.http,
+            &self.base_url,
+            &format!("v1/matches/active?account_ids={}", join_ids(account_ids)),
+        )
+        .await
+    }
+
+    async fn names(&self) -> Arc<Names> {
+        let mut cached = self.names.lock().await;
+        if let Some((loaded_at, names)) = cached.as_ref()
+            && loaded_at.elapsed() < NAMES_TTL
+        {
+            return Arc::clone(names);
+        }
+        let heroes =
+            get_json::<Vec<NamedAsset>>(&self.http, &self.base_url, "v1/assets/heroes").await;
+        let ranks =
+            get_json::<Vec<NamedAsset>>(&self.http, &self.base_url, "v1/assets/ranks").await;
+        let (Ok(heroes), Ok(ranks)) = (heroes, ranks) else {
+            return cached
+                .as_ref()
+                .map(|(_, names)| Arc::clone(names))
+                .unwrap_or_default();
+        };
+        let names = Arc::new((index_names(heroes), index_names(ranks)));
+        *cached = Some((Instant::now(), Arc::clone(&names)));
+        names
+    }
+
+    /// Build the post for one live match. `linked` maps account IDs to Discord user IDs.
+    pub(crate) async fn scout(
+        &self,
+        live: &ActiveMatch,
+        linked: &HashMap<u32, u64>,
+    ) -> CreateEmbed {
+        let names = self.names().await;
+        let account_ids = live
+            .players
+            .iter()
+            .filter_map(|player| player.account_id)
+            .collect::<Vec<_>>();
+        let profiles = get_json::<Vec<SteamProfile>>(
+            &self.http,
+            &self.base_url,
+            &format!("v1/players/steam?account_ids={}", join_ids(&account_ids)),
+        )
+        .await
+        .map(|profiles| {
+            profiles
+                .into_iter()
+                .filter_map(|profile| Some((profile.account_id, profile.personaname?)))
+                .collect::<HashMap<_, _>>()
+        })
+        .unwrap_or_default();
+
+        let semaphore = Arc::new(Semaphore::new(LOOKUP_CONCURRENCY));
+        let mut lookups = JoinSet::new();
+        for (index, player) in live.players.iter().enumerate() {
+            let (Some(account_id), hero_id) =
+                (player.account_id, player.hero_id.unwrap_or_default())
+            else {
+                continue;
+            };
+            let (http, base_url, semaphore) = (
+                self.http.clone(),
+                Arc::clone(&self.base_url),
+                Arc::clone(&semaphore),
+            );
+            lookups.spawn(async move {
+                let _permit = semaphore.acquire_owned().await;
+                let rank =
+                    get_json::<Rank>(&http, &base_url, &format!("v1/players/{account_id}/rank"))
+                        .await;
+                let history = get_json::<Vec<HistoryEntry>>(
+                    &http,
+                    &base_url,
+                    &format!("v1/players/{account_id}/match-history"),
+                )
+                .await;
+                let badge = rank.ok().and_then(|rank| rank.badge);
+                (
+                    index,
+                    badge,
+                    history
+                        .ok()
+                        .map(|history| summarize_history(&history, hero_id)),
+                )
+            });
+        }
+        let mut results = HashMap::new();
+        while let Some(Ok((index, badge, summary))) = lookups.join_next().await {
+            results.insert(index, (badge, summary));
+        }
+
+        let mut lines: [Vec<String>; 2] = [Vec::new(), Vec::new()];
+        let mut friend_teams = [false, false];
+        for (index, player) in live.players.iter().enumerate() {
+            let Some(team) = player
+                .team
+                .and_then(|team| usize::try_from(team).ok())
+                .filter(|team| *team < 2)
+            else {
+                continue;
+            };
+            let discord_user = player
+                .account_id
+                .and_then(|account_id| linked.get(&account_id).copied());
+            friend_teams[team] |= discord_user.is_some();
+            let (badge, summary) = results.remove(&index).unwrap_or((None, None));
+            let hero_id = player.hero_id.unwrap_or_default();
+            let hero = names
+                .0
+                .get(&hero_id)
+                .cloned()
+                .unwrap_or_else(|| format!("Hero {hero_id}"));
+            let name = player
+                .account_id
+                .and_then(|account_id| profiles.get(&account_id))
+                .map(String::as_str)
+                .unwrap_or("Unknown player");
+            let rank = badge
+                .map(|badge| rank_label(badge, &names.1))
+                .unwrap_or_else(|| "Unknown rank".into());
+            lines[team].push(player_line(
+                name,
+                &hero,
+                &rank,
+                summary.as_ref(),
+                discord_user,
+            ));
+        }
+        live_embed(live, &lines, friend_teams)
+    }
+}
+
+type LiveResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+async fn get_json<T: DeserializeOwned>(
+    http: &HttpClient,
+    base_url: &str,
+    path: &str,
+) -> LiveResult<T> {
+    let response = http
+        .get(format!("{base_url}/{path}"))
+        .send()
+        .await?
+        .error_for_status()?;
+    Ok(serde_json::from_slice(&response.bytes().await?)?)
+}
+
+fn join_ids(ids: &[u32]) -> String {
+    ids.iter().map(u32::to_string).collect::<Vec<_>>().join(",")
+}
+
+fn index_names(assets: Vec<NamedAsset>) -> HashMap<u32, String> {
+    assets
+        .into_iter()
+        .filter_map(|asset| Some((asset.id?, asset.name?)))
+        .collect()
+}
+
+/// A badge such as 81 is tier 8 (Oracle), subrank 1.
+pub(crate) fn rank_label(badge: u32, rank_names: &HashMap<u32, String>) -> String {
+    let (tier, subrank) = (badge / 10, badge % 10);
+    if tier == 0 {
+        return "Unranked".into();
+    }
+    let name = rank_names
+        .get(&tier)
+        .cloned()
+        .unwrap_or_else(|| format!("Rank {tier}"));
+    if subrank == 0 {
+        name
+    } else {
+        format!("{name} {subrank}")
+    }
+}
+
+fn won(entry: &HistoryEntry) -> bool {
+    // player_match_outcome is only set on recent matches; the winning team is on all of them.
+    entry.match_result.is_some() && entry.match_result == entry.player_team
+}
+
+/// Recent form plus experience on the hero being played. History is newest first.
+pub(crate) fn summarize_history(history: &[HistoryEntry], hero_id: u32) -> Summary {
+    let recent = &history[..history.len().min(RECENT_MATCHES)];
+    let total = |pick: fn(&HistoryEntry) -> Option<u32>| {
+        recent.iter().filter_map(pick).map(f64::from).sum::<f64>()
+    };
+    let kills = total(|entry| entry.player_kills);
+    let deaths = total(|entry| entry.player_deaths);
+    let assists = total(|entry| entry.player_assists);
+    let on_hero = history
+        .iter()
+        .filter(|entry| entry.hero_id == Some(hero_id))
+        .collect::<Vec<_>>();
+    let hero_wins = on_hero.iter().filter(|entry| won(entry)).count();
+    Summary {
+        recent: recent.len(),
+        wins: recent.iter().filter(|entry| won(entry)).count(),
+        kda: (kills + assists) / deaths.max(1.0),
+        hero_matches: on_hero.len(),
+        hero_win_rate: (!on_hero.is_empty()).then(|| hero_wins as f64 / on_hero.len() as f64),
+    }
+}
+
+pub(crate) fn escape_markdown(text: &str) -> String {
+    text.chars()
+        .flat_map(|character| {
+            let escape = matches!(character, '\\' | '*' | '_' | '~' | '`' | '|' | '>');
+            escape
+                .then_some('\\')
+                .into_iter()
+                .chain(std::iter::once(character))
+        })
+        .collect()
+}
+
+pub(crate) fn player_line(
+    name: &str,
+    hero: &str,
+    rank: &str,
+    summary: Option<&Summary>,
+    discord_user: Option<u64>,
+) -> String {
+    let who = discord_user
+        .map(|user| format!("<@{user}>"))
+        .unwrap_or_else(|| escape_markdown(name));
+    let mut line = format!("**{hero}** · {who} · {rank}");
+    let Some(summary) = summary.filter(|summary| summary.recent > 0) else {
+        line.push_str(" · no public match history");
+        return line;
+    };
+    line.push_str(&format!(
+        " · {}-{} last {} · {:.1} KDA",
+        summary.wins,
+        summary.recent - summary.wins,
+        summary.recent,
+        summary.kda
+    ));
+    match summary.hero_win_rate {
+        Some(rate) => line.push_str(&format!(
+            " · {} on hero ({:.0}%)",
+            summary.hero_matches,
+            rate * 100.0
+        )),
+        None => line.push_str(" · first time on hero"),
+    }
+    line
+}
+
+/// Field name and value pairs, the linked players' team first.
+pub(crate) fn live_fields(
+    lines: &[Vec<String>; 2],
+    friend_teams: [bool; 2],
+) -> Vec<(String, String)> {
+    let one_side = friend_teams[0] != friend_teams[1];
+    let order = if one_side && friend_teams[1] {
+        [1, 0]
+    } else {
+        [0, 1]
+    };
+    order
+        .into_iter()
+        .filter(|team| !lines[*team].is_empty())
+        .map(|team| {
+            let name = if one_side {
+                let side = if friend_teams[team] {
+                    "Your team"
+                } else {
+                    "Enemy team"
+                };
+                format!("{side} — {}", TEAM_NAMES[team])
+            } else {
+                TEAM_NAMES[team].to_string()
+            };
+            (name, truncate(&lines[team].join("\n"), FIELD_LIMIT))
+        })
+        .collect()
+}
+
+fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let mut out = text.chars().take(limit - 1).collect::<String>();
+    out.push('…');
+    out
+}
+
+pub(crate) fn live_title(live: &ActiveMatch) -> String {
+    let mode = live.match_mode_parsed.as_deref().unwrap_or("Match");
+    match live
+        .region_mode_parsed
+        .as_deref()
+        .filter(|region| !region.is_empty())
+    {
+        Some(region) => {
+            let region = region
+                .split('_')
+                .map(|word| {
+                    let mut chars = word.chars();
+                    chars
+                        .next()
+                        .map(|first| first.to_uppercase().chain(chars).collect::<String>())
+                        .unwrap_or_default()
+                })
+                .collect::<Vec<_>>()
+                .join(" ");
+            format!("Live: {mode} · {region}")
+        }
+        None => format!("Live: {mode}"),
+    }
+}
+
+fn live_embed(
+    live: &ActiveMatch,
+    lines: &[Vec<String>; 2],
+    friend_teams: [bool; 2],
+) -> CreateEmbed {
+    let started = live
+        .start_time
+        .map(|time| format!(" · started <t:{time}:R>"))
+        .unwrap_or_default();
+    let mut embed = CreateEmbed::new()
+        .title(live_title(live))
+        .description(format!("Match {}{started}", live.match_id))
+        .colour(0xE8A33A);
+    for (name, value) in live_fields(lines, friend_teams) {
+        embed = embed.field(name, value, false);
+    }
+    embed.footer(CreateEmbedFooter::new(
+        "Live data from the community-run Deadlock API · ranks and form are public history",
+    ))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(won_match: bool, hero_id: u32, kills: u32, deaths: u32, assists: u32) -> HistoryEntry {
+        HistoryEntry {
+            hero_id: Some(hero_id),
+            player_kills: Some(kills),
+            player_deaths: Some(deaths),
+            player_assists: Some(assists),
+            match_result: Some(if won_match { 0 } else { 1 }),
+            player_team: Some(0),
+        }
+    }
+
+    #[test]
+    fn rank_label_splits_badge_into_tier_and_subrank() {
+        let names = HashMap::from([(8, "Oracle".to_string()), (11, "Eternus".to_string())]);
+
+        assert_eq!(rank_label(81, &names), "Oracle 1");
+        assert_eq!(rank_label(110, &names), "Eternus");
+        assert_eq!(rank_label(0, &names), "Unranked");
+        assert_eq!(rank_label(43, &names), "Rank 4 3");
+    }
+
+    #[test]
+    fn summary_uses_recent_form_and_whole_hero_history() {
+        let mut history = vec![entry(true, 10, 10, 2, 6); 15];
+        history.extend(vec![entry(false, 20, 5, 8, 5); 10]);
+        history.extend(vec![entry(true, 10, 5, 5, 5); 5]);
+
+        let summary = summarize_history(&history, 10);
+
+        assert_eq!(summary.recent, 20);
+        assert_eq!(summary.wins, 15);
+        assert!((summary.kda - (15.0 * 16.0 + 5.0 * 10.0) / (15.0 * 2.0 + 5.0 * 8.0)).abs() < 1e-9);
+        assert_eq!(summary.hero_matches, 20);
+        assert_eq!(summary.hero_win_rate, Some(1.0));
+    }
+
+    #[test]
+    fn old_matches_without_an_outcome_still_count_wins() {
+        let old_win = HistoryEntry {
+            match_result: Some(1),
+            player_team: Some(1),
+            ..Default::default()
+        };
+        let no_result = HistoryEntry {
+            player_team: Some(0),
+            ..Default::default()
+        };
+
+        assert!(won(&old_win));
+        assert!(!won(&no_result));
+    }
+
+    #[test]
+    fn player_line_handles_friends_new_heroes_and_private_history() {
+        let summary = summarize_history(&[entry(true, 20, 5, 5, 5), entry(false, 20, 5, 5, 5)], 10);
+
+        assert_eq!(
+            player_line("J~", "Haze", "Oracle 1", Some(&summary), None),
+            "**Haze** · J\\~ · Oracle 1 · 1-1 last 2 · 2.0 KDA · first time on hero"
+        );
+        assert!(player_line("x", "Haze", "Unranked", Some(&summary), Some(7)).contains("<@7>"));
+        assert_eq!(
+            player_line("a_b", "Haze", "Unranked", None, None),
+            "**Haze** · a\\_b · Unranked · no public match history"
+        );
+    }
+
+    #[test]
+    fn friends_team_comes_first() {
+        let lines = [vec!["enemy".to_string()], vec!["friend".to_string()]];
+
+        let fields = live_fields(&lines, [false, true]);
+
+        assert_eq!(fields[0].0, "Your team — Sapphire Flame");
+        assert_eq!(fields[1].0, "Enemy team — Amber Hand");
+        assert_eq!(live_fields(&lines, [true, true])[0].0, "Amber Hand");
+    }
+
+    #[test]
+    fn title_names_mode_and_region() {
+        let live = ActiveMatch {
+            match_mode_parsed: Some("Ranked".into()),
+            region_mode_parsed: Some("south_america".into()),
+            ..Default::default()
+        };
+
+        assert_eq!(live_title(&live), "Live: Ranked · South America");
+    }
+
+    #[test]
+    fn parses_the_active_match_feed() {
+        let feed = r#"[{"match_id":117300454,"start_time":1792060426,"match_mode_parsed":"Unranked",
+            "region_mode_parsed":"europe","duration_s":null,
+            "players":[{"account_id":114558767,"team":0,"team_parsed":"Team0","abandoned":null,"hero_id":10}]}]"#;
+
+        let matches: Vec<ActiveMatch> = serde_json::from_str(feed).expect("feed parses");
+
+        assert_eq!(matches[0].match_id, 117300454);
+        assert_eq!(matches[0].players[0].account_id, Some(114558767));
+    }
+
+    /// Builds a post from a match being played now. Needs the network:
+    /// `cargo test -- --ignored live_scout_against_community_api --nocapture`
+    #[tokio::test]
+    #[ignore]
+    async fn live_scout_against_community_api() {
+        let scout = LiveScout::from_env(HttpClient::new()).unwrap().unwrap();
+        let all: Vec<ActiveMatch> = get_json(&scout.http, &scout.base_url, "v1/matches/active")
+            .await
+            .unwrap();
+        let friend = all[0].players[3].account_id.unwrap();
+        let matches = scout.active_matches(&[friend]).await.unwrap();
+        let embed = scout
+            .scout(&matches[0], &HashMap::from([(friend, 1)]))
+            .await;
+        let embed = serde_json::to_value(embed).unwrap();
+        println!("{}", serde_json::to_string_pretty(&embed).unwrap());
+        assert!(
+            embed["fields"][0]["value"]
+                .as_str()
+                .unwrap()
+                .contains("<@1>")
+        );
+    }
+}
