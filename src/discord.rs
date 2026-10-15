@@ -32,6 +32,7 @@ use tracing::{info, warn};
 
 use crate::discord_format::{Cell, Column, TEAM_COLOURS, Tone, table};
 use crate::discord_live::{LiveScout, TEAM_NAMES, live_heading};
+use crate::live::CANCELLED_WITHIN_SECONDS;
 
 const DEFAULT_API_URL: &str = "http://127.0.0.1:8080/api";
 const DEFAULT_WEB_URL: &str = "http://127.0.0.1";
@@ -175,6 +176,9 @@ struct StateFile {
     /// (hero, name) of the friends in each live-posted match, for the summary.
     #[serde(default)]
     live_friends: BTreeMap<u64, Vec<(String, String)>>,
+    /// The live post for each reported match, deleted if the match is cancelled.
+    #[serde(default)]
+    live_messages: BTreeMap<u64, u64>,
 }
 
 struct State {
@@ -887,6 +891,46 @@ impl Service {
         state.save().await
     }
 
+    /// Deletes the live post of a lobby that was destroyed within minutes of
+    /// forming: the match was cancelled because someone failed to load in.
+    async fn delete_cancelled_posts(&self, reported: &[ApiLiveMatch]) {
+        let Some(http) = self.http.lock().await.clone() else {
+            return;
+        };
+        for report in reported.iter().filter(|report| cancelled(report)) {
+            let Some(message_id) = self
+                .state
+                .lock()
+                .await
+                .file
+                .live_messages
+                .get(&report.match_id)
+                .copied()
+            else {
+                continue;
+            };
+            let deleted = self
+                .config
+                .channel_id
+                .delete_message(&http, serenity::all::MessageId::new(message_id))
+                .await;
+            match deleted {
+                Ok(()) => info!(
+                    match_id = report.match_id,
+                    "Deleted the post for a cancelled match"
+                ),
+                Err(error) => {
+                    warn!(match_id = report.match_id, %error, "Could not delete the post for a cancelled match")
+                }
+            }
+            let mut state = self.state.lock().await;
+            state.file.live_messages.remove(&report.match_id);
+            if let Err(error) = state.save().await {
+                warn!(%error, "Could not save the bot state");
+            }
+        }
+    }
+
     /// Starts a lookup for each match a collector reported starting.
     async fn poll_reported_once(self: &Arc<Self>) -> Result<(), Box<dyn std::error::Error>> {
         if self.live.is_none() || self.http.lock().await.is_none() {
@@ -897,6 +941,7 @@ impl Service {
             .api
             .list_live(now.saturating_sub(REPORTED_MAX_AGE_SECONDS))
             .await?;
+        self.delete_cancelled_posts(&reported).await;
         for report in reported {
             let Some(started_at) = report.started_at else {
                 continue;
@@ -949,6 +994,17 @@ impl Service {
             .await?;
         // Remember it now so a restart doesn't post the match twice.
         self.remember_live_post(report.match_id).await?;
+        {
+            let mut state = self.state.lock().await;
+            state
+                .file
+                .live_messages
+                .insert(report.match_id, message.id.get());
+            while state.file.live_messages.len() > LIVE_POSTED_LIMIT {
+                state.file.live_messages.pop_first();
+            }
+            state.save().await?;
+        }
         info!(match_id = report.match_id, "Posted match found");
 
         let mut lookup = live
@@ -1105,6 +1161,14 @@ impl Service {
     ) -> Result<(), Box<dyn std::error::Error>> {
         self.config.channel_id.send_message(http, message).await?;
         Ok(())
+    }
+}
+
+/// A lobby destroyed within five minutes of forming never became a match.
+fn cancelled(report: &ApiLiveMatch) -> bool {
+    match (report.started_at, report.ended_at) {
+        (Some(started), Some(ended)) => ended.saturating_sub(started) < CANCELLED_WITHIN_SECONDS,
+        _ => false,
     }
 }
 
@@ -1500,6 +1564,7 @@ fn empty_state() -> StateFile {
         links: BTreeMap::new(),
         live_posted: Vec::new(),
         live_friends: BTreeMap::new(),
+        live_messages: BTreeMap::new(),
     }
 }
 
@@ -1607,6 +1672,19 @@ mod tests {
         );
         let message = serde_json::json!({"content": post.content, "embeds": post.embeds});
         println!("{message}");
+    }
+
+    #[test]
+    fn short_lobbies_count_as_cancelled() {
+        let report = |ended_at| ApiLiveMatch {
+            match_id: 1,
+            started_at: Some(1_000),
+            ended_at,
+            account_ids: Vec::new(),
+        };
+        assert!(cancelled(&report(Some(1_078))));
+        assert!(!cancelled(&report(Some(1_000 + CANCELLED_WITHIN_SECONDS))));
+        assert!(!cancelled(&report(None)));
     }
 
     #[test]
