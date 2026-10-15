@@ -323,6 +323,8 @@ impl ReadApiState {
         let mut request = self
             .client
             .post(url)
+            // Return UInt64/Int64 as JSON numbers, not quoted strings.
+            .query(&[("output_format_json_quote_64bit_integers", "0")])
             // The SQL goes in the body: ClickHouse rejects a POST without a
             // body (411 Length Required), and long queries stay out of the URL.
             .header("content-type", "text/plain")
@@ -351,12 +353,41 @@ impl ReadApiState {
         body.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
-                serde_json::from_str(line).map_err(|error| {
-                    warn!(%error, "read API ClickHouse row was invalid JSON");
-                })
+                serde_json::from_str(line)
+                    .map(unqualify_columns)
+                    .map_err(|error| {
+                        warn!(%error, "read API ClickHouse row was invalid JSON");
+                    })
             })
             .collect()
     }
+}
+
+/// ClickHouse's analyzer names a selected column `m.match_id` when the bare
+/// name is ambiguous across joined tables. Rows are read by bare names, so
+/// drop the table prefix unless that would overwrite another column.
+fn unqualify_columns(row: Value) -> Value {
+    let Value::Object(map) = row else {
+        return row;
+    };
+    let mut out = serde_json::Map::with_capacity(map.len());
+    let mut qualified = Vec::new();
+    for (key, value) in map {
+        match key.rsplit_once('.') {
+            Some((_, bare)) if !bare.is_empty() => qualified.push((bare.to_string(), key, value)),
+            _ => {
+                out.insert(key, value);
+            }
+        }
+    }
+    for (bare, key, value) in qualified {
+        if out.contains_key(&bare) {
+            out.insert(key, value);
+        } else {
+            out.insert(bare, value);
+        }
+    }
+    Value::Object(out)
 }
 
 pub(crate) async fn list_matches(
@@ -1315,5 +1346,16 @@ mod tests {
             .find(|(_, name)| name.eq_ignore_ascii_case("cheesecake"))
             .map(|(account_id, name)| (*account_id, name.clone()));
         assert_eq!(found, Some((42, "Cheesecake".to_string())));
+    }
+
+    #[test]
+    fn unqualifies_ambiguous_clickhouse_columns() {
+        let row = serde_json::json!({"m.match_id": 7, "start_time": 1, "p.team": 0, "team": 1});
+        let row = unqualify_columns(row);
+
+        assert_eq!(row["match_id"], 7);
+        assert_eq!(row["start_time"], 1);
+        assert_eq!(row["team"], 1);
+        assert_eq!(row["p.team"], 0);
     }
 }
