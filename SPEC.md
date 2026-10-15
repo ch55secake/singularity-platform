@@ -53,9 +53,15 @@ browser link to a player page without exposing or accepting a Steam account ID.
 
 The match detail response includes the final player-stat snapshot, every stats
 timeline row, source-normalized damage, item/ability events, death events,
-world-coordinate paths, and the current map asset. Missing optional metadata is
-represented by nulls or empty arrays. A healthy service returns `503` for read
-requests when ClickHouse is unavailable.
+world-coordinate paths, time-stamped objective and mid-boss events with map
+positions when available, and the current map asset. Missing optional metadata
+is represented by nulls or empty arrays. A healthy service returns `503` for
+read requests when ClickHouse is unavailable.
+
+Each objective event includes `t` (seconds since match start), `kind`, and
+`team` (the structure's owning team, or the claiming team for `mid_boss`). Its
+`position` is an `[x, y]` world-coordinate pair or `null` when the current map
+assets do not provide a location for that objective.
 
 Match detail players include a versioned `impact` score with combat, economy,
 utility, and survival components, each in the `-5..+5` range. Version 1
@@ -118,8 +124,12 @@ Steam credentials.
 The `metadata-parser` command decodes the protobuf handoff with the pinned
 Deadlock `valveprotos` definitions and inserts match, player, and timeline rows
 into ClickHouse using JSONEachRow. It tracks processed job digests separately
-and uses the `schema/002_matches.sql` ReplacingMergeTree tables for idempotent
-re-parsing. Timeline rows include the upstream aim, kill-type, damage,
+and uses the `schema/002_matches.sql` and `schema/006_objectives.sql`
+ReplacingMergeTree tables for idempotent re-parsing. Destroyed objectives and
+mid-boss claims are stored in `match_objectives`. Upgrading the parse-state file
+from version 1 clears its processed-file cursor once, so retained metadata is
+reparsed to backfill objective events while preserving public match UUIDs.
+Timeline rows include the upstream aim, kill-type, damage,
 mitigation, healing, power, and health counters. The derived views expose
 accuracy, hero crit rate, mutually exclusive bullet/ability/melee kill shares,
 headshot kill share, and damage taken per minute. Per-account averages use the

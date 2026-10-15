@@ -185,6 +185,14 @@ pub(crate) struct Death {
 }
 
 #[derive(Debug, Serialize)]
+struct ObjectiveEvent {
+    t: u32,
+    team: i32,
+    kind: String,
+    position: Option<[f64; 2]>,
+}
+
+#[derive(Debug, Serialize)]
 struct PathData {
     x: Vec<f32>,
     y: Vec<f32>,
@@ -201,6 +209,8 @@ pub(crate) struct Paths {
 struct MapData {
     radius: f64,
     image: String,
+    #[serde(skip)]
+    objective_positions: BTreeMap<String, [f64; 2]>,
 }
 
 #[derive(Debug, Serialize)]
@@ -215,6 +225,7 @@ pub(crate) struct MatchDetail {
     average_badge: [Option<u32>; 2],
     players: Vec<Player>,
     deaths: Vec<Death>,
+    objectives: Vec<ObjectiveEvent>,
     paths: Paths,
     map: MapData,
 }
@@ -481,6 +492,7 @@ pub(crate) async fn get_match(
     let deaths = load_deaths(&state.read_api, core.match_id).await?;
     let paths = load_paths(&state.read_api, core.match_id).await?;
     let map = load_map(&state.read_api).await?;
+    let objectives = load_objectives(&state.read_api, core.match_id, &map).await?;
     let mut players: Vec<Player> = core
         .players
         .iter()
@@ -516,6 +528,7 @@ pub(crate) async fn get_match(
         average_badge: core.average_badge,
         players,
         deaths,
+        objectives,
         paths,
         map,
     }))
@@ -1105,20 +1118,100 @@ async fn load_paths(
 
 async fn load_map(state: &ReadApiState) -> Result<MapData, (StatusCode, Json<ErrorBody>)> {
     let sql = format!(
-        "SELECT radius, minimap_url FROM {db}.map_assets ORDER BY snapshot_version DESC LIMIT 1",
+        "SELECT radius, minimap_url, payload_json FROM {db}.map_assets ORDER BY snapshot_version DESC LIMIT 1",
+        db = state.database,
+    );
+    let rows = query_rows(state, &sql).await?;
+    let Some(row) = rows.first() else {
+        return Ok(MapData {
+            radius: 0.0,
+            image: String::new(),
+            objective_positions: BTreeMap::new(),
+        });
+    };
+    let radius = number_f64(row, "radius");
+    let objective_positions = string_value(row, "payload_json")
+        .and_then(|payload| serde_json::from_str::<Value>(&payload).ok())
+        .and_then(|payload| payload.get("objective_positions").cloned())
+        .and_then(|positions| positions.as_object().cloned())
+        .map(|positions| {
+            positions
+                .into_iter()
+                .filter_map(|(name, position)| {
+                    let left = position.get("left_relative")?.as_f64()?;
+                    let top = position.get("top_relative")?.as_f64()?;
+                    Some((name, map_relative_to_world(left, top, radius)))
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    Ok(MapData {
+        radius,
+        image: string_value(row, "minimap_url").unwrap_or_default(),
+        objective_positions,
+    })
+}
+
+async fn load_objectives(
+    state: &ReadApiState,
+    match_id: u64,
+    map: &MapData,
+) -> Result<Vec<ObjectiveEvent>, (StatusCode, Json<ErrorBody>)> {
+    let sql = format!(
+        "SELECT event_index, argMax(objective_id, metadata_version) AS objective_id, argMax(team, metadata_version) AS team, argMax(game_time_s, metadata_version) AS game_time_s FROM {db}.match_objectives WHERE match_id = {match_id} GROUP BY event_index ORDER BY game_time_s, event_index",
         db = state.database,
     );
     let rows = query_rows(state, &sql).await?;
     Ok(rows
-        .first()
-        .map(|row| MapData {
-            radius: number_f64(row, "radius"),
-            image: string_value(row, "minimap_url").unwrap_or_default(),
+        .into_iter()
+        .filter_map(|row| {
+            let objective_id = number_u32(&row, "objective_id")?;
+            let team = number_i32(&row, "team")?;
+            let kind = objective_kind(objective_id)?.to_string();
+            let position = if objective_id == 16 {
+                Some([0.0, 0.0])
+            } else {
+                objective_position_key(objective_id, team)
+                    .and_then(|key| map.objective_positions.get(&key).copied())
+            };
+            Some(ObjectiveEvent {
+                t: number_u32(&row, "game_time_s")?,
+                team,
+                kind,
+                position,
+            })
         })
-        .unwrap_or_else(|| MapData {
-            radius: 0.0,
-            image: String::new(),
-        }))
+        .collect())
+}
+
+fn objective_kind(objective_id: u32) -> Option<&'static str> {
+    match objective_id {
+        0 => Some("patron_core"),
+        1..=4 => Some("guardian"),
+        5..=8 => Some("walker"),
+        9 => Some("patron"),
+        10..=11 => Some("shrine"),
+        12..=15 => Some("base_guardian"),
+        16 => Some("mid_boss"),
+        _ => None,
+    }
+}
+
+fn objective_position_key(objective_id: u32, team: i32) -> Option<String> {
+    if !(0..=1).contains(&team) {
+        return None;
+    }
+    match objective_id {
+        0 => Some(format!("team{team}_core")),
+        1..=4 => Some(format!("team{team}_tier1_{objective_id}")),
+        5..=8 => Some(format!("team{team}_tier2_{}", objective_id - 4)),
+        9 => Some(format!("team{team}_titan")),
+        _ => None,
+    }
+}
+
+fn map_relative_to_world(left: f64, top: f64, radius: f64) -> [f64; 2] {
+    [(left * 2.0 - 1.0) * radius, (1.0 - top * 2.0) * radius]
 }
 
 fn build_player(
@@ -1509,6 +1602,42 @@ mod tests {
         let json = serde_json::to_value(hero).unwrap();
 
         assert_eq!(json["icon"], "https://assets.example/billy.webp");
+    }
+
+    #[test]
+    fn maps_objective_ids_to_labels_and_asset_positions() {
+        assert_eq!(objective_kind(1), Some("guardian"));
+        assert_eq!(objective_kind(7), Some("walker"));
+        assert_eq!(objective_kind(9), Some("patron"));
+        assert_eq!(objective_kind(16), Some("mid_boss"));
+        assert_eq!(objective_kind(99), None);
+        assert_eq!(
+            objective_position_key(1, 1).as_deref(),
+            Some("team1_tier1_1")
+        );
+        assert_eq!(
+            objective_position_key(7, 0).as_deref(),
+            Some("team0_tier2_3")
+        );
+        assert_eq!(objective_position_key(16, 0), None);
+        assert_eq!(objective_position_key(1, 2), None);
+        let position = map_relative_to_world(0.21, 0.39, 10_752.0);
+        assert!((position[0] + 6_236.16).abs() < 1e-9);
+        assert!((position[1] - 2_365.44).abs() < 1e-9);
+    }
+
+    #[test]
+    fn keeps_map_asset_positions_internal_to_the_browser_response() {
+        let map = MapData {
+            radius: 10_752.0,
+            image: "https://assets.example/map.png".to_string(),
+            objective_positions: BTreeMap::from([("team0_core".to_string(), [0.0, 0.0])]),
+        };
+
+        let json = serde_json::to_value(map).unwrap();
+
+        assert_eq!(json["radius"], 10_752.0);
+        assert!(json.get("objective_positions").is_none());
     }
 
     #[test]

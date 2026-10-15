@@ -147,6 +147,12 @@ alignment, compare a death's `game_time_s` with the matching victim path
 sample; the sample metadata's nearest point is within a few world units of
 `death_pos`.
 
+Destroyed objectives and mid-boss claims are written to `match_objectives` with
+their source objective IDs, owning/claiming teams, and game times. Apply
+`schema/006_objectives.sql` before starting the metadata parser or read API.
+The parser's one-time state upgrade reparses retained `.pb` files to backfill
+these events, without changing the stable public match IDs.
+
 Apply `schema/003_assets.sql` after `schema/002_matches.sql` so
 `match_player_items_with_assets` can resolve timeline IDs from the hero/item
 snapshots. The view uses the asset payload's `type` field to distinguish
