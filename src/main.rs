@@ -156,6 +156,14 @@ struct IngestBody {
 
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
+    // Before subcommands too, so the workers and the Discord bot log.
+    tracing_subscriber::fmt()
+        .with_env_filter(
+            tracing_subscriber::EnvFilter::try_from_default_env()
+                .unwrap_or_else(|_| "singularity_platform=info".into()),
+        )
+        .init();
+
     let command = parse_command(env::args().skip(1))
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if let Some(command) = command {
@@ -168,13 +176,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             Command::DiscordBot => discord::run().await,
         };
     }
-
-    tracing_subscriber::fmt()
-        .with_env_filter(
-            tracing_subscriber::EnvFilter::try_from_default_env()
-                .unwrap_or_else(|_| "singularity_platform=info".into()),
-        )
-        .init();
 
     let spool_path = PathBuf::from(
         env::var("SINGULARITY_SPOOL_PATH").unwrap_or_else(|_| DEFAULT_SPOOL.to_string()),
