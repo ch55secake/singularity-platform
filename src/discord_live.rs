@@ -32,7 +32,7 @@ const DEFAULT_LIVE_POLL_SECONDS: u64 = 120;
 const RECENT_MATCHES: usize = 20;
 const LOOKUP_CONCURRENCY: usize = 6;
 const NAMES_TTL: Duration = Duration::from_secs(24 * 60 * 60);
-pub(crate) const TEAM_NAMES: [&str; 2] = ["Amber Hand", "Sapphire Flame"];
+pub(crate) const TEAM_NAMES: [&str; 2] = ["Hidden King", "Archmother"];
 /// Recent games per player searched for shared matches.
 const STACK_WINDOW: usize = 30;
 /// Same-team games two players must share to count as a stack.
@@ -104,7 +104,7 @@ impl Snapshot {
         else {
             return false;
         };
-        // The broadcast numbers teams 2 (Amber Hand) and 3 (Sapphire Flame).
+        // The broadcast numbers teams 2 (Hidden King) and 3 (Archmother).
         let team = match row.team {
             2 => 0,
             3 => 1,
@@ -1007,9 +1007,9 @@ mod tests {
     fn friends_team_comes_first() {
         let headings = team_headings([false, true]);
 
-        assert_eq!(headings[0], (1, "Your team · Sapphire Flame".to_string()));
-        assert_eq!(headings[1], (0, "Enemy team · Amber Hand".to_string()));
-        assert_eq!(team_headings([true, true])[0].1, "Amber Hand");
+        assert_eq!(headings[0], (1, "Your team · Archmother".to_string()));
+        assert_eq!(headings[1], (0, "Enemy team · Hidden King".to_string()));
+        assert_eq!(team_headings([true, true])[0].1, "Hidden King");
     }
 
     #[test]
