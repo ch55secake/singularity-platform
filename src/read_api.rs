@@ -475,7 +475,7 @@ pub(crate) async fn list_matches(
         return Err(api_error(StatusCode::BAD_REQUEST, "invalid pagination"));
     }
     let sql = format!(
-        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, m.average_badge_team0, m.average_badge_team1, p.account_id, p.player_slot, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM (SELECT public_id, match_id, start_time, duration_s, winning_team, average_badge_team0, average_badge_team1 FROM {db}.matches ORDER BY start_time DESC, match_id DESC LIMIT {limit} OFFSET {offset}) AS m LEFT JOIN {db}.match_players AS p ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id ORDER BY m.start_time DESC, m.match_id DESC, p.player_slot",
+        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, m.average_badge_team0, m.average_badge_team1, p.account_id, p.player_slot, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM (SELECT public_id, match_id, start_time, duration_s, winning_team, average_badge_team0, average_badge_team1 FROM {db}.matches FINAL ORDER BY start_time DESC, match_id DESC LIMIT {limit} OFFSET {offset}) AS m LEFT JOIN {db}.match_players AS p FINAL ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h FINAL ON h.id = p.hero_id ORDER BY m.start_time DESC, m.match_id DESC, p.player_slot",
         db = state.read_api.database,
     );
     let rows = state
@@ -503,7 +503,7 @@ pub(crate) async fn list_sessions(
         .collect::<Vec<_>>()
         .join(",");
     let sql = format!(
-        "WITH target_matches AS (SELECT public_id AS uuid, match_id, start_time, duration_s, winning_team FROM {db}.matches WHERE match_id IN (SELECT DISTINCT match_id FROM {db}.match_players WHERE account_id IN ({member_ids}))), latest_stats AS (SELECT stats.match_id, stats.player_slot, argMax(ifNull(stats.player_damage, 0), stats.snapshot_time_s) AS hero_damage, argMax(ifNull(stats.player_healing, 0), stats.snapshot_time_s) AS healing, argMax(ifNull(stats.damage_mitigated, 0), stats.snapshot_time_s) AS damage_mitigated FROM {db}.match_player_stats AS stats WHERE stats.match_id IN (SELECT match_id FROM target_matches) GROUP BY stats.match_id, stats.player_slot) SELECT target_matches.uuid, target_matches.match_id, target_matches.start_time, target_matches.duration_s, target_matches.winning_team, players.account_id, players.player_slot, players.team, players.kills, players.deaths, players.assists, players.net_worth AS souls, players.last_hits, players.denies, ifNull(latest_stats.hero_damage, 0) AS hero_damage, ifNull(latest_stats.healing, 0) AS healing, ifNull(latest_stats.damage_mitigated, 0) AS damage_mitigated FROM target_matches INNER JOIN {db}.match_players AS players ON players.match_id = target_matches.match_id LEFT JOIN latest_stats ON latest_stats.match_id = players.match_id AND latest_stats.player_slot = players.player_slot ORDER BY target_matches.start_time, target_matches.match_id, players.player_slot",
+        "WITH target_matches AS (SELECT public_id AS uuid, match_id, start_time, duration_s, winning_team FROM {db}.matches FINAL WHERE match_id IN (SELECT DISTINCT match_id FROM {db}.match_players FINAL WHERE account_id IN ({member_ids}))), latest_stats AS (SELECT stats.match_id, stats.player_slot, argMax(ifNull(stats.player_damage, 0), stats.snapshot_time_s) AS hero_damage, argMax(ifNull(stats.player_healing, 0), stats.snapshot_time_s) AS healing, argMax(ifNull(stats.damage_mitigated, 0), stats.snapshot_time_s) AS damage_mitigated FROM {db}.match_player_stats AS stats WHERE stats.match_id IN (SELECT match_id FROM target_matches) GROUP BY stats.match_id, stats.player_slot) SELECT target_matches.uuid, target_matches.match_id, target_matches.start_time, target_matches.duration_s, target_matches.winning_team, players.account_id, players.player_slot, players.team, players.kills, players.deaths, players.assists, players.net_worth AS souls, players.last_hits, players.denies, ifNull(latest_stats.hero_damage, 0) AS hero_damage, ifNull(latest_stats.healing, 0) AS healing, ifNull(latest_stats.damage_mitigated, 0) AS damage_mitigated FROM target_matches INNER JOIN {db}.match_players AS players FINAL ON players.match_id = target_matches.match_id LEFT JOIN latest_stats ON latest_stats.match_id = players.match_id AND latest_stats.player_slot = players.player_slot ORDER BY target_matches.start_time, target_matches.match_id, players.player_slot",
         db = state.read_api.database,
     );
     let rows = query_rows(&state.read_api, &sql).await?;
@@ -754,7 +754,7 @@ async fn load_core(
     selector: &str,
 ) -> Result<Option<CoreMatch>, (StatusCode, Json<ErrorBody>)> {
     let sql = format!(
-        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, m.average_badge_team0, m.average_badge_team1, p.account_id, p.player_slot, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m LEFT JOIN {db}.match_players AS p ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h ON h.id = p.hero_id WHERE {selector} ORDER BY p.player_slot",
+        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, m.average_badge_team0, m.average_badge_team1, p.account_id, p.player_slot, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m FINAL LEFT JOIN {db}.match_players AS p FINAL ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h FINAL ON h.id = p.hero_id WHERE {selector} ORDER BY p.player_slot",
         db = state.database,
     );
     let rows = state
@@ -781,7 +781,7 @@ fn group_core_rows(rows: Vec<Value>, members: &HashMap<u32, String>) -> Vec<Matc
             }
         };
         if let Some(player) = player {
-            grouped[index].players.push(player);
+            push_unique_core_player(&mut grouped[index].players, player);
         }
     }
     grouped
@@ -810,10 +810,16 @@ fn group_core(rows: Vec<Value>) -> Option<CoreMatch> {
         };
         let core = grouped.get_or_insert(match_data);
         if let Some(player) = player {
-            core.players.push(player);
+            push_unique_core_player(&mut core.players, player);
         }
     }
     grouped
+}
+
+fn push_unique_core_player(players: &mut Vec<CorePlayer>, player: CorePlayer) {
+    if !players.iter().any(|existing| existing.slot == player.slot) {
+        players.push(player);
+    }
 }
 
 fn sessions_from_rows(rows: Vec<Value>, members: &HashMap<u32, String>) -> Vec<SessionSummary> {
@@ -2133,6 +2139,37 @@ mod tests {
         assert_eq!(matches[0].players[0].member.as_ref().unwrap().name, "oscar");
         assert_eq!(matches[1].uuid, "old");
         assert!(matches[1].players[0].member.is_none());
+    }
+
+    #[test]
+    fn ignores_duplicate_player_slots_when_building_match_summaries() {
+        let unique_players = (1..=12)
+            .map(|player_slot| {
+                serde_json::json!({
+                    "uuid": "match",
+                    "match_id": 7,
+                    "start_time": 10,
+                    "player_slot": player_slot,
+                    "account_id": player_slot + 100,
+                    "team": if player_slot <= 6 { 0 } else { 1 },
+                    "hero_id": 72,
+                    "hero_name": "Billy",
+                    "kills": 3,
+                    "deaths": 1,
+                    "assists": 4
+                })
+            })
+            .collect::<Vec<_>>();
+        let rows = unique_players
+            .iter()
+            .flat_map(|player| [player.clone(), player.clone()])
+            .collect();
+
+        let matches = group_core_rows(rows, &HashMap::new());
+
+        assert_eq!(matches.len(), 1);
+        assert_eq!(matches[0].players.len(), 12);
+        assert_eq!(matches[0].mode, "6v6");
     }
 
     #[test]
