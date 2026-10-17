@@ -1639,8 +1639,8 @@ mod tests {
             "❌ **Defeat** · **6v6** · 31:50\n👥 <@5> · [View full match](<http://rake/m/abc>)"
         );
         let embeds = serde_json::to_value(&post.embeds).unwrap();
-        assert_eq!(embeds[0]["title"], "🔵 Sapphire Flame");
-        assert_eq!(embeds[1]["title"], "🟠 Amber Hand · Victory 🏆");
+        assert_eq!(embeds[0]["title"], "🔵 Archmother");
+        assert_eq!(embeds[1]["title"], "🟠 Hidden King · Victory 🏆");
         let ours = &embeds[0]["fields"][0];
         assert_eq!(ours["name"], "Vyper · hobnobs");
         assert!(
