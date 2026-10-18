@@ -15,9 +15,11 @@ mod rate_limit;
 mod read_api;
 mod replay;
 mod salt_spool;
+mod server_config;
 
 use commands::{Command, parse_command};
 use salt_spool::{SaltKey, SaltRecord};
+use server_config::MAX_REQUEST_BODY_BYTES;
 
 use std::{
     collections::HashSet,
@@ -46,8 +48,6 @@ use tracing::{info, warn};
 const DEFAULT_BIND: &str = "0.0.0.0:8080";
 const DEFAULT_SPOOL: &str = "data/salts.jsonl";
 const DEFAULT_CREDENTIALS: &str = "data/collectors.json";
-const MAX_BATCH_SIZE: usize = 1_000;
-const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024;
 #[derive(Clone)]
 struct AppState {
     legacy_token: Option<String>,
@@ -117,12 +117,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     );
     let credential_store = credentials::CredentialStore::load(&credentials_path).await?;
     let credential_count = credential_store.len();
-    let legacy_token = non_empty_env("SINGULARITY_INGEST_TOKEN");
+    let legacy_token = server_config::non_empty_env("SINGULARITY_INGEST_TOKEN");
     let authentication_required = legacy_token.is_some() || credential_count > 0;
     if !authentication_required {
         warn!("no ingestion credentials configured; authentication is disabled for development");
     }
-    let max_batch_size = configured_batch_size()?;
+    let max_batch_size = server_config::configured_batch_size()?;
     let rate_limit = rate_limit::configured_rate_limit()?;
     let read_api = read_api::ReadApiState::from_env()?;
     let live_path = live::store_path(&spool_path);
@@ -271,26 +271,6 @@ async fn allow_request(state: &AppState, collector_id: &str) -> bool {
     windows.consume(collector_id, state.rate_limit)
 }
 
-fn non_empty_env(name: &str) -> Option<String> {
-    env::var(name).ok().filter(|value| !value.is_empty())
-}
-
-fn configured_batch_size() -> Result<usize, std::io::Error> {
-    let value = env::var("SINGULARITY_COLLECTOR_MAX_BATCH_SIZE")
-        .unwrap_or_else(|_| MAX_BATCH_SIZE.to_string())
-        .parse::<usize>()
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid batch limit")
-        })?;
-    if value == 0 || value > MAX_BATCH_SIZE {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "batch limit must be between 1 and 1000",
-        ));
-    }
-    Ok(value)
-}
-
 fn internal_error() -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -352,7 +332,7 @@ mod tests {
                 max_requests: 10,
                 window: std::time::Duration::from_secs(60),
             },
-            max_batch_size: MAX_BATCH_SIZE,
+            max_batch_size: server_config::MAX_BATCH_SIZE,
             authentication_required: true,
             read_api: read_api::ReadApiState::from_env().expect("read API state initializes"),
             live: Arc::new(Mutex::new(live::LiveStore::empty(
