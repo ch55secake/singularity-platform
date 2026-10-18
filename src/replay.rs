@@ -1,28 +1,24 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     env,
-    fs::File as StdFile,
-    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
-use bzip2::read::BzDecoder;
-use reqwest::{Client, StatusCode};
+use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{
-    fs::{self, OpenOptions},
-    io::AsyncWriteExt,
-};
-use zstd::stream::read::Decoder as ZstdDecoder;
+use tokio::fs;
 
+mod download;
 mod parser;
+mod state;
 
+use download::download_replay;
+#[cfg(test)]
+use download::{decompress_file, decompress_replay, replay_url};
 use parser::{MODEL_VERSION, PARSER_VERSION, parse_replay};
+use state::{ReplayJob, ReplayState, ReplayStatus};
 
 const DEFAULT_SPOOL_PATH: &str = "data/salts.jsonl";
 const DEFAULT_STATE_PATH: &str = "data/replay-state.json";
@@ -35,49 +31,11 @@ const DEFAULT_MAX_COMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
 const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 const DEFAULT_MAX_DISK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
 const DEFAULT_DEBUG_RETENTION_SECONDS: u64 = 0;
-const ZSTD_MAGIC: [u8; 4] = [0x28, 0xb5, 0x2f, 0xfd];
 #[derive(Debug, Clone, Deserialize)]
 struct ReplayRecord {
     match_id: u64,
     cluster_id: Option<u32>,
     replay_salt: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ReplayStatus {
-    #[serde(rename = "replay_pending")]
-    Pending,
-    #[serde(rename = "replay_downloaded")]
-    Downloaded,
-    #[serde(rename = "replay_parsed")]
-    Parsed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReplayJob {
-    status: ReplayStatus,
-    attempts: u32,
-    next_retry_at: Option<u64>,
-    last_error: Option<String>,
-    raw_path: Option<String>,
-    position_count: Option<u32>,
-    #[serde(default)]
-    parser_version: Option<String>,
-    #[serde(default)]
-    raw_retention_until: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReplayStateFile {
-    version: u32,
-    #[serde(default)]
-    jobs: BTreeMap<String, ReplayJob>,
-}
-
-struct ReplayState {
-    path: PathBuf,
-    jobs: BTreeMap<String, ReplayJob>,
 }
 
 struct ReplayConfig {
@@ -119,11 +77,6 @@ struct WorkerSummary {
     parsed: usize,
     deferred: usize,
     failed: usize,
-}
-
-#[derive(Debug)]
-struct ReplayError {
-    code: &'static str,
 }
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
@@ -275,72 +228,6 @@ fn non_negative_env(name: &str, default: u64) -> Result<u64, std::io::Error> {
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid replay setting")
         })
-}
-
-impl ReplayState {
-    async fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let contents = match fs::read(path).await {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        if contents.is_empty() {
-            return Ok(Self {
-                path: path.to_path_buf(),
-                jobs: BTreeMap::new(),
-            });
-        }
-        #[cfg(unix)]
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-        let file: ReplayStateFile = serde_json::from_slice(&contents)?;
-        if file.version != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unsupported replay state version",
-            )
-            .into());
-        }
-        Ok(Self {
-            path: path.to_path_buf(),
-            jobs: file.jobs,
-        })
-    }
-
-    async fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).await?;
-        }
-        let contents = serde_json::to_vec_pretty(&ReplayStateFile {
-            version: 1,
-            jobs: self.jobs.clone(),
-        })?;
-        let temp_path = self.path.with_file_name(format!(
-            ".{}.tmp-{}-{}",
-            self.path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("replay-state.json"),
-            std::process::id(),
-            now_nanos()
-        ));
-        let mut temp = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await?;
-        temp.write_all(&contents).await?;
-        temp.flush().await?;
-        temp.sync_data().await?;
-        drop(temp);
-        #[cfg(unix)]
-        fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).await?;
-        fs::rename(temp_path, &self.path).await?;
-        Ok(())
-    }
 }
 
 async fn process_record(
@@ -587,250 +474,6 @@ async fn record_failure(
     Ok(())
 }
 
-async fn download_replay(
-    client: &Client,
-    config: &ReplayConfig,
-    record: &ReplayRecord,
-    raw_path: &Path,
-) -> Result<(), ReplayError> {
-    let compressed_path = raw_path.with_file_name(format!(
-        ".{}.compressed-{}",
-        raw_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("replay.dem"),
-        now_nanos()
-    ));
-    let response = client
-        .get(replay_url(config, record))
-        .send()
-        .await
-        .map_err(|_| ReplayError {
-            code: "request_failed",
-        })?;
-    let status = response.status();
-    if !status.is_success() {
-        return Err(ReplayError {
-            code: if status == StatusCode::NOT_FOUND {
-                "http_404"
-            } else if status.is_server_error() {
-                "http_5xx"
-            } else {
-                "http_error"
-            },
-        });
-    }
-    if response
-        .content_length()
-        .is_some_and(|length| length > config.max_compressed_bytes)
-    {
-        return Err(ReplayError {
-            code: "compressed_too_large",
-        });
-    }
-    let mut compressed_file = OpenOptions::new()
-        .create_new(true)
-        .write(true)
-        .open(&compressed_path)
-        .await
-        .map_err(|_| ReplayError {
-            code: "temporary_file_failed",
-        })?;
-    let download_result = async {
-        let mut compressed_bytes = 0_u64;
-        let mut response = response;
-        while let Some(chunk) = response.chunk().await.map_err(|_| ReplayError {
-            code: "response_failed",
-        })? {
-            if compressed_bytes.saturating_add(chunk.len() as u64) > config.max_compressed_bytes {
-                return Err(ReplayError {
-                    code: "compressed_too_large",
-                });
-            }
-            compressed_file
-                .write_all(&chunk)
-                .await
-                .map_err(|_| ReplayError {
-                    code: "temporary_file_failed",
-                })?;
-            compressed_bytes += chunk.len() as u64;
-        }
-        compressed_file.flush().await.map_err(|_| ReplayError {
-            code: "temporary_file_failed",
-        })?;
-        compressed_file.sync_data().await.map_err(|_| ReplayError {
-            code: "temporary_file_failed",
-        })?;
-        Ok(())
-    }
-    .await;
-    if let Err(error) = download_result {
-        let _ = fs::remove_file(&compressed_path).await;
-        return Err(error);
-    }
-    drop(compressed_file);
-
-    let compressed_path_for_worker = compressed_path.clone();
-    let raw_path_for_worker = raw_path.to_path_buf();
-    let max_decompressed_bytes = config.max_decompressed_bytes;
-    let result = tokio::task::spawn_blocking(move || {
-        decompress_file(
-            &compressed_path_for_worker,
-            &raw_path_for_worker,
-            max_decompressed_bytes,
-        )
-    })
-    .await
-    .map_err(|_| ReplayError {
-        code: "decompression_failed",
-    })?;
-    let _ = fs::remove_file(&compressed_path).await;
-    result.map_err(|code| ReplayError { code })
-}
-
-fn replay_url(config: &ReplayConfig, record: &ReplayRecord) -> String {
-    let cluster = record.cluster_id.expect("downloadable record has cluster");
-    let salt = record
-        .replay_salt
-        .expect("downloadable record has replay salt");
-    format!(
-        "{}/{match_id}_{salt}.dem.bz2",
-        config
-            .base_url
-            .replace("{cluster}", &cluster.to_string())
-            .trim_end_matches('/'),
-        match_id = record.match_id,
-    )
-}
-
-#[cfg(test)]
-fn decompress_replay(
-    compressed: &[u8],
-    max_decompressed_bytes: u64,
-) -> Result<Vec<u8>, &'static str> {
-    use std::io::Cursor;
-
-    if compressed.starts_with(&ZSTD_MAGIC) {
-        let decoder =
-            ZstdDecoder::new(Cursor::new(compressed)).map_err(|_| "decompression_failed")?;
-        return read_limited(decoder, max_decompressed_bytes);
-    }
-    if compressed.starts_with(b"BZh") {
-        return read_limited(
-            BzDecoder::new(Cursor::new(compressed)),
-            max_decompressed_bytes,
-        );
-    }
-    Err("unsupported_compression")
-}
-
-#[cfg(test)]
-fn read_limited<R: Read>(reader: R, max_decompressed_bytes: u64) -> Result<Vec<u8>, &'static str> {
-    let mut limited = reader.take(max_decompressed_bytes.saturating_add(1));
-    let mut output = Vec::new();
-    limited
-        .read_to_end(&mut output)
-        .map_err(|_| "decompression_failed")?;
-    if output.len() as u64 > max_decompressed_bytes {
-        return Err("decompressed_too_large");
-    }
-    Ok(output)
-}
-
-fn decompress_file(
-    compressed_path: &Path,
-    raw_path: &Path,
-    max_decompressed_bytes: u64,
-) -> Result<(), &'static str> {
-    let mut compressed = StdFile::open(compressed_path).map_err(|_| "decompression_failed")?;
-    let mut magic = [0_u8; 4];
-    compressed
-        .read_exact(&mut magic)
-        .map_err(|_| "decompression_failed")?;
-    compressed
-        .seek(SeekFrom::Start(0))
-        .map_err(|_| "decompression_failed")?;
-
-    let raw_temp_path = raw_path.with_file_name(format!(
-        ".{}.tmp-{}",
-        raw_path
-            .file_name()
-            .and_then(|name| name.to_str())
-            .unwrap_or("replay.dem"),
-        now_nanos()
-    ));
-    let result = if magic == ZSTD_MAGIC {
-        let decoder = ZstdDecoder::new(compressed).map_err(|_| "decompression_failed")?;
-        write_decompressed(decoder, &raw_temp_path, max_decompressed_bytes)
-    } else if magic.starts_with(b"BZh") {
-        let decoder = BzDecoder::new(compressed);
-        write_decompressed(decoder, &raw_temp_path, max_decompressed_bytes)
-    } else {
-        Err("unsupported_compression")
-    };
-    if result.is_err() {
-        let _ = std::fs::remove_file(&raw_temp_path);
-        return result;
-    }
-    #[cfg(unix)]
-    std::fs::set_permissions(&raw_temp_path, std::fs::Permissions::from_mode(0o600))
-        .map_err(|_| "temporary_file_failed")?;
-    std::fs::rename(raw_temp_path, raw_path).map_err(|_| "temporary_file_failed")
-}
-
-fn write_decompressed<R: Read>(
-    reader: R,
-    raw_temp_path: &Path,
-    max_decompressed_bytes: u64,
-) -> Result<(), &'static str> {
-    let file = StdFile::create_new(raw_temp_path).map_err(|_| "temporary_file_failed")?;
-    let mut writer = LimitedWriter {
-        file,
-        written: 0,
-        max: max_decompressed_bytes,
-    };
-    std::io::copy(
-        &mut reader.take(max_decompressed_bytes.saturating_add(1)),
-        &mut writer,
-    )
-    .map_err(|error| {
-        if error.kind() == std::io::ErrorKind::FileTooLarge {
-            "decompressed_too_large"
-        } else {
-            "decompression_failed"
-        }
-    })?;
-    writer
-        .file
-        .sync_data()
-        .map_err(|_| "temporary_file_failed")?;
-    Ok(())
-}
-
-struct LimitedWriter {
-    file: StdFile,
-    written: u64,
-    max: u64,
-}
-
-impl Write for LimitedWriter {
-    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
-        if buffer.len() as u64 > self.max.saturating_sub(self.written) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::FileTooLarge,
-                "decompressed replay exceeds configured limit",
-            ));
-        }
-        let written = self.file.write(buffer)?;
-        self.written += written as u64;
-        Ok(written)
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()
-    }
-}
-
 async fn disk_usage(path: &Path) -> Result<u64, std::io::Error> {
     let mut total: u64 = 0;
     let mut entries = match fs::read_dir(path).await {
@@ -939,9 +582,10 @@ fn now_nanos() -> u128 {
 mod tests {
     use super::*;
     use bzip2::{Compression, write::BzEncoder};
+    use std::collections::BTreeMap;
     use std::fs as std_fs;
     use std::io::{Cursor, Write};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn sample_record() -> ReplayRecord {
