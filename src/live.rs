@@ -27,8 +27,8 @@ use tokio::{
 use tracing::{info, warn};
 
 use crate::{
-    AppState, ErrorBody, MAX_MATCH_ID, SaltRecord, allow_request, authenticate, internal_error,
-    now_seconds, read_api, store_records,
+    AppState, ErrorBody, allow_request, authenticate, internal_error, now_seconds, read_api,
+    salt_spool::{MAX_MATCH_ID, SaltRecord, store_records},
 };
 
 const DEFAULT_DEADLOCK_API_URL: &str = "https://api.deadlock-api.com";

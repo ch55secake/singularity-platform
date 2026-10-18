@@ -13,14 +13,16 @@ mod parser;
 mod rate_limit;
 mod read_api;
 mod replay;
+mod salt_spool;
 
 use commands::{Command, parse_command};
+use salt_spool::{SaltKey, SaltRecord};
 
 use std::{
     collections::HashSet,
     env,
     net::SocketAddr,
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::Arc,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -31,11 +33,10 @@ use axum::{
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
-use serde::{Deserialize, Serialize};
+use serde::Serialize;
 use subtle::ConstantTimeEq;
 use tokio::{
     fs::{self, OpenOptions},
-    io::AsyncWriteExt,
     net::TcpListener,
     sync::Mutex,
 };
@@ -46,7 +47,6 @@ const DEFAULT_SPOOL: &str = "data/salts.jsonl";
 const DEFAULT_CREDENTIALS: &str = "data/collectors.json";
 const MAX_BATCH_SIZE: usize = 1_000;
 const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024;
-const MAX_MATCH_ID: u64 = 10_000_000_000;
 const LEGACY_COLLECTOR_ID: &str = "legacy-global-token";
 const ANONYMOUS_COLLECTOR_ID: &str = "anonymous-development";
 
@@ -62,36 +62,6 @@ struct AppState {
     authentication_required: bool,
     read_api: read_api::ReadApiState,
     live: Arc<Mutex<live::LiveStore>>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq, Hash)]
-struct SaltRecord {
-    match_id: u64,
-    cluster_id: Option<u32>,
-    metadata_salt: Option<u32>,
-    replay_salt: Option<u32>,
-    username: Option<String>,
-    #[serde(default)]
-    collector_id: Option<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct SaltKey {
-    match_id: u64,
-    cluster_id: Option<u32>,
-    metadata_salt: Option<u32>,
-    replay_salt: Option<u32>,
-}
-
-impl From<&SaltRecord> for SaltKey {
-    fn from(record: &SaltRecord) -> Self {
-        Self {
-            match_id: record.match_id,
-            cluster_id: record.cluster_id,
-            metadata_salt: record.metadata_salt,
-            replay_salt: record.replay_salt,
-        }
-    }
 }
 
 #[derive(Debug, Serialize)]
@@ -134,7 +104,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(parent) = spool_path.parent() {
         fs::create_dir_all(parent).await?;
     }
-    let seen = load_seen(&spool_path).await?;
+    let seen = salt_spool::load_seen(&spool_path).await?;
     let recovered_records = seen.len();
     let spool = OpenOptions::new()
         .create(true)
@@ -266,7 +236,7 @@ async fn ingest_salts(
     }
 
     for record in &records {
-        if !valid_record(record) {
+        if !salt_spool::valid_record(record) {
             return Err((
                 StatusCode::BAD_REQUEST,
                 Json(ErrorBody {
@@ -280,83 +250,11 @@ async fn ingest_salts(
         record.collector_id = Some(collector_id.clone());
     }
 
-    let (accepted, duplicates) = store_records(&state, records).await?;
+    let (accepted, duplicates) = salt_spool::store_records(&state, records).await?;
     Ok(Json(IngestBody {
         accepted,
         duplicates,
     }))
-}
-
-/// Appends new salt records to the spool. Returns (accepted, duplicates).
-async fn store_records(
-    state: &AppState,
-    records: Vec<SaltRecord>,
-) -> Result<(usize, usize), (StatusCode, Json<ErrorBody>)> {
-    let mut seen = state.seen.lock().await;
-    let mut spool = state.spool.lock().await;
-    let mut accepted = 0;
-    let mut duplicates = 0;
-    for record in records {
-        let key = SaltKey::from(&record);
-        if seen.contains(&key) {
-            duplicates += 1;
-            continue;
-        }
-        let line = serde_json::to_string(&record).map_err(|_| internal_error())?;
-        spool
-            .write_all(line.as_bytes())
-            .await
-            .map_err(|_| internal_error())?;
-        spool.write_all(b"\n").await.map_err(|_| internal_error())?;
-        seen.insert(key);
-        accepted += 1;
-    }
-    spool.flush().await.map_err(|_| internal_error())?;
-    spool.sync_data().await.map_err(|_| internal_error())?;
-    Ok((accepted, duplicates))
-}
-
-async fn load_seen(path: &Path) -> Result<HashSet<SaltKey>, std::io::Error> {
-    let contents = match fs::read_to_string(path).await {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error),
-    };
-    Ok(recover_seen(&contents))
-}
-
-fn recover_seen(contents: &str) -> HashSet<SaltKey> {
-    let mut seen = HashSet::new();
-    let mut lines = contents.split('\n').peekable();
-    let mut line_number = 0;
-
-    while let Some(line) = lines.next() {
-        line_number += 1;
-        if line.trim().is_empty() {
-            continue;
-        }
-
-        match serde_json::from_str::<SaltRecord>(line) {
-            Ok(record) if valid_record(&record) => {
-                seen.insert(SaltKey::from(&record));
-            }
-            Ok(_) => {
-                warn!(line = line_number, "ignoring invalid record in salt spool");
-            }
-            Err(error) if lines.peek().is_none() => {
-                warn!(
-                    line = line_number,
-                    %error,
-                    "ignoring incomplete final line in salt spool"
-                );
-            }
-            Err(error) => {
-                warn!(line = line_number, %error, "ignoring malformed record in salt spool");
-            }
-        }
-    }
-
-    seen
 }
 
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
@@ -419,12 +317,6 @@ fn configured_batch_size() -> Result<usize, std::io::Error> {
     Ok(value)
 }
 
-fn valid_record(record: &SaltRecord) -> bool {
-    record.match_id > 0
-        && record.match_id <= MAX_MATCH_ID
-        && (record.metadata_salt.is_some() || record.replay_salt.is_some())
-}
-
 fn internal_error() -> (StatusCode, Json<ErrorBody>) {
     (
         StatusCode::INTERNAL_SERVER_ERROR,
@@ -447,55 +339,6 @@ mod tests {
             username: None,
             collector_id: None,
         }
-    }
-
-    #[test]
-    fn accepts_metadata_or_replay_salts() {
-        assert!(valid_record(&sample_record()));
-        assert!(valid_record(&SaltRecord {
-            match_id: 42,
-            cluster_id: Some(1),
-            metadata_salt: None,
-            replay_salt: Some(3),
-            username: None,
-            collector_id: None,
-        }));
-    }
-
-    #[test]
-    fn rejects_records_without_salts() {
-        assert!(!valid_record(&SaltRecord {
-            match_id: 42,
-            cluster_id: Some(1),
-            metadata_salt: None,
-            replay_salt: None,
-            username: None,
-            collector_id: None,
-        }));
-    }
-
-    #[test]
-    fn recovers_records_from_spool_and_ignores_truncated_final_line() {
-        let record = sample_record();
-        let complete = serde_json::to_string(&record).expect("sample record serializes");
-        let contents = format!("{complete}\n{{\"match_id\":42");
-
-        let seen = recover_seen(&contents);
-
-        assert_eq!(seen.len(), 1);
-        assert!(seen.contains(&SaltKey::from(&record)));
-    }
-
-    #[test]
-    fn recovers_only_valid_records() {
-        let record = sample_record();
-        let complete = serde_json::to_string(&record).expect("sample record serializes");
-        let contents = format!("{complete}\n{{\"match_id\":0,\"metadata_salt\":null}}\n");
-
-        let seen = recover_seen(&contents);
-
-        assert_eq!(seen.len(), 1);
-        assert!(seen.contains(&SaltKey::from(&record)));
     }
 
     #[test]
