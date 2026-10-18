@@ -4,14 +4,13 @@ use std::{
 };
 
 use reqwest::Client;
-use serde::Deserialize;
-use sha2::{Digest, Sha256};
 use tokio::fs;
 
 mod clickhouse;
 mod config;
 mod download;
 mod parser;
+mod record;
 mod state;
 mod worker;
 
@@ -21,15 +20,9 @@ use download::download_replay;
 #[cfg(test)]
 use download::{decompress_file, decompress_replay, replay_url};
 use parser::{MODEL_VERSION, PARSER_VERSION, parse_replay};
+use record::{ReplayRecord, job_id};
 use state::{ReplayJob, ReplayState, ReplayStatus};
 use worker::{WorkerSummary, disk_usage, process_record};
-
-#[derive(Debug, Clone, Deserialize)]
-struct ReplayRecord {
-    match_id: u64,
-    cluster_id: Option<u32>,
-    replay_salt: Option<u32>,
-}
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = ReplayConfig::from_env()?;
@@ -94,22 +87,6 @@ pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
         config.max_disk_bytes,
     );
     Ok(())
-}
-
-impl ReplayRecord {
-    fn is_downloadable(&self) -> bool {
-        self.match_id > 0
-            && self.cluster_id.is_some_and(|cluster| cluster > 0)
-            && self.replay_salt.is_some_and(|salt| salt > 0)
-    }
-}
-
-fn job_id(record: &ReplayRecord) -> String {
-    let mut digest = Sha256::new();
-    digest.update(record.match_id.to_le_bytes());
-    digest.update(record.cluster_id.unwrap_or_default().to_le_bytes());
-    digest.update(record.replay_salt.unwrap_or_default().to_le_bytes());
-    hex::encode(digest.finalize())
 }
 
 fn now_nanos() -> u128 {
@@ -418,23 +395,5 @@ mod tests {
             .await
             .expect("ClickHouse server completes");
         std_fs::remove_dir_all(directory).expect("test directory removes");
-    }
-
-    #[test]
-    fn replay_job_id_does_not_expose_the_salt() {
-        let id = job_id(&sample_record());
-        assert!(!id.contains("456"));
-        assert_eq!(id.len(), 64);
-    }
-
-    #[test]
-    fn rejects_replay_records_without_required_values() {
-        let mut record = sample_record();
-        assert!(record.is_downloadable());
-        record.replay_salt = None;
-        assert!(!record.is_downloadable());
-        record.replay_salt = Some(456);
-        record.cluster_id = None;
-        assert!(!record.is_downloadable());
     }
 }
