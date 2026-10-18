@@ -3,6 +3,7 @@
 
 mod assets;
 mod commands;
+mod credentials;
 mod discord;
 mod discord_format;
 mod discord_live;
@@ -12,10 +13,10 @@ mod parser;
 mod read_api;
 mod replay;
 
-use commands::{Command, CredentialCommand, parse_command};
+use commands::{Command, parse_command};
 
 use std::{
-    collections::{BTreeMap, HashMap, HashSet},
+    collections::{HashMap, HashSet},
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
@@ -23,18 +24,13 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
     http::{HeaderMap, StatusCode, header::AUTHORIZATION},
     routing::{get, post},
 };
-use getrandom::fill as fill_random;
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 use tokio::{
     fs::{self, OpenOptions},
@@ -58,7 +54,7 @@ const ANONYMOUS_COLLECTOR_ID: &str = "anonymous-development";
 #[derive(Clone)]
 struct AppState {
     legacy_token: Option<String>,
-    credentials: Arc<Mutex<CredentialStore>>,
+    credentials: Arc<Mutex<credentials::CredentialStore>>,
     spool: Arc<Mutex<tokio::fs::File>>,
     seen: Arc<Mutex<HashSet<SaltKey>>>,
     rate_windows: Arc<Mutex<HashMap<String, RateWindow>>>,
@@ -78,28 +74,6 @@ struct SaltRecord {
     username: Option<String>,
     #[serde(default)]
     collector_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CredentialRecord {
-    token_hash: String,
-    created_at: u64,
-    #[serde(default)]
-    rotated_at: Option<u64>,
-    #[serde(default)]
-    revoked_at: Option<u64>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct CredentialFile {
-    version: u32,
-    #[serde(default)]
-    credentials: BTreeMap<String, CredentialRecord>,
-}
-
-struct CredentialStore {
-    path: PathBuf,
-    records: BTreeMap<String, CredentialRecord>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -158,7 +132,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .map_err(|error| std::io::Error::new(std::io::ErrorKind::InvalidInput, error))?;
     if let Some(command) = command {
         return match command {
-            Command::Credentials(command) => run_credential_command(command).await,
+            Command::Credentials(command) => credentials::run_command(command).await,
             Command::MetadataWorker => metadata::run().await,
             Command::MetadataParser => parser::run().await,
             Command::ReplayWorker => replay::run().await,
@@ -186,8 +160,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         env::var("SINGULARITY_CREDENTIALS_PATH")
             .unwrap_or_else(|_| DEFAULT_CREDENTIALS.to_string()),
     );
-    let credential_store = CredentialStore::load(&credentials_path).await?;
-    let credential_count = credential_store.records.len();
+    let credential_store = credentials::CredentialStore::load(&credentials_path).await?;
+    let credential_count = credential_store.len();
     let legacy_token = non_empty_env("SINGULARITY_INGEST_TOKEN");
     let authentication_required = legacy_token.is_some() || credential_count > 0;
     if !authentication_required {
@@ -398,178 +372,8 @@ fn recover_seen(contents: &str) -> HashSet<SaltKey> {
     seen
 }
 
-impl CredentialStore {
-    async fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let contents = match fs::read(path).await {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        if contents.is_empty() {
-            return Ok(Self {
-                path: path.to_path_buf(),
-                records: BTreeMap::new(),
-            });
-        }
-
-        #[cfg(unix)]
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-
-        let file: CredentialFile = serde_json::from_slice(&contents)?;
-        if file.version != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unsupported credential file version",
-            )
-            .into());
-        }
-        Ok(Self {
-            path: path.to_path_buf(),
-            records: file.credentials,
-        })
-    }
-
-    async fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = self.path.parent() {
-            fs::create_dir_all(parent).await?;
-        }
-        let file = CredentialFile {
-            version: 1,
-            credentials: self.records.clone(),
-        };
-        let contents = serde_json::to_vec_pretty(&file)?;
-        let temp_path = self.path.with_file_name(format!(
-            ".{}.tmp-{}-{}",
-            self.path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("collectors.json"),
-            std::process::id(),
-            now_seconds()
-        ));
-        let mut temp = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await?;
-        temp.write_all(&contents).await?;
-        temp.flush().await?;
-        temp.sync_data().await?;
-        drop(temp);
-        #[cfg(unix)]
-        fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).await?;
-        fs::rename(temp_path, &self.path).await?;
-        Ok(())
-    }
-
-    fn create(&mut self, collector_id: &str) -> Result<String, String> {
-        if self.records.contains_key(collector_id) {
-            return Err("collector already exists; use rotate instead".to_string());
-        }
-        let token = generate_token()?;
-        self.records.insert(
-            collector_id.to_string(),
-            CredentialRecord {
-                token_hash: hash_token(&token),
-                created_at: now_seconds(),
-                rotated_at: None,
-                revoked_at: None,
-            },
-        );
-        Ok(token)
-    }
-
-    fn rotate(&mut self, collector_id: &str) -> Result<String, String> {
-        let record = self
-            .records
-            .get_mut(collector_id)
-            .ok_or_else(|| "collector does not exist".to_string())?;
-        let token = generate_token()?;
-        record.token_hash = hash_token(&token);
-        record.rotated_at = Some(now_seconds());
-        record.revoked_at = None;
-        Ok(token)
-    }
-
-    fn revoke(&mut self, collector_id: &str) -> Result<(), String> {
-        let record = self
-            .records
-            .get_mut(collector_id)
-            .ok_or_else(|| "collector does not exist".to_string())?;
-        record.revoked_at = Some(now_seconds());
-        Ok(())
-    }
-
-    fn authenticate(&self, token: &str) -> Option<String> {
-        let token_hash = hash_token(token);
-        self.records.iter().find_map(|(collector_id, record)| {
-            if record.revoked_at.is_none()
-                && constant_time_eq(record.token_hash.as_bytes(), token_hash.as_bytes())
-            {
-                Some(collector_id.clone())
-            } else {
-                None
-            }
-        })
-    }
-}
-
-async fn run_credential_command(
-    command: CredentialCommand,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let path = PathBuf::from(
-        env::var("SINGULARITY_CREDENTIALS_PATH")
-            .unwrap_or_else(|_| DEFAULT_CREDENTIALS.to_string()),
-    );
-    let mut store = CredentialStore::load(&path).await?;
-    match command {
-        CredentialCommand::Create(collector_id) => {
-            let token = store
-                .create(&collector_id)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::AlreadyExists, error))?;
-            store.save().await?;
-            println!("collector_id={collector_id}");
-            println!("token={token}");
-            println!("store this token securely; it will not be shown again");
-        }
-        CredentialCommand::Rotate(collector_id) => {
-            let token = store
-                .rotate(&collector_id)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))?;
-            store.save().await?;
-            println!("collector_id={collector_id}");
-            println!("token={token}");
-            println!("the previous token is no longer valid");
-        }
-        CredentialCommand::Revoke(collector_id) => {
-            store
-                .revoke(&collector_id)
-                .map_err(|error| std::io::Error::new(std::io::ErrorKind::NotFound, error))?;
-            store.save().await?;
-            println!("revoked collector_id={collector_id}");
-        }
-        CredentialCommand::List => {
-            for (collector_id, record) in &store.records {
-                let status = if record.revoked_at.is_some() {
-                    "revoked"
-                } else {
-                    "active"
-                };
-                println!("{collector_id}\t{status}");
-            }
-        }
-    }
-    Ok(())
-}
-
-fn generate_token() -> Result<String, String> {
-    let mut bytes = [0_u8; 32];
-    fill_random(&mut bytes).map_err(|_| "could not generate secure credential".to_string())?;
-    Ok(format!("sg_{}", hex::encode(bytes)))
-}
-
-fn hash_token(token: &str) -> String {
-    hex::encode(Sha256::digest(token.as_bytes()))
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    bool::from(left.ct_eq(right))
 }
 
 fn now_seconds() -> u64 {
@@ -577,10 +381,6 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
-}
-
-fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
-    bool::from(left.ct_eq(right))
 }
 
 async fn authenticate(headers: &HeaderMap, state: &AppState) -> Option<String> {
@@ -758,33 +558,6 @@ mod tests {
     }
 
     #[test]
-    fn credential_lifecycle_hashes_tokens_and_revokes_old_tokens() {
-        let mut store = CredentialStore {
-            path: PathBuf::from("collectors.json"),
-            records: BTreeMap::new(),
-        };
-
-        let first_token = store.create("collector-a").expect("credential creates");
-        let serialized = serde_json::to_string(&store.records).expect("credentials serialize");
-        assert!(!serialized.contains(&first_token));
-        assert_eq!(
-            store.authenticate(&first_token),
-            Some("collector-a".to_string())
-        );
-
-        let second_token = store.rotate("collector-a").expect("credential rotates");
-        assert_ne!(first_token, second_token);
-        assert_eq!(store.authenticate(&first_token), None);
-        assert_eq!(
-            store.authenticate(&second_token),
-            Some("collector-a".to_string())
-        );
-
-        store.revoke("collector-a").expect("credential revokes");
-        assert_eq!(store.authenticate(&second_token), None);
-    }
-
-    #[test]
     fn malformed_authorization_is_rejected_without_parsing_a_token() {
         let mut headers = HeaderMap::new();
         headers.insert(AUTHORIZATION, "Basic not-a-bearer-token".parse().unwrap());
@@ -808,6 +581,8 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_replays_are_deduplicated_and_attributed() {
+        use std::time::{SystemTime, UNIX_EPOCH};
+
         let spool_path = env::temp_dir().join(format!(
             "singularity-platform-test-{}-{}.jsonl",
             std::process::id(),
@@ -823,23 +598,16 @@ mod tests {
             .open(&spool_path)
             .await
             .expect("test spool opens");
-        let token = "collector-test-token";
-        let mut records = BTreeMap::new();
-        records.insert(
-            "collector-a".to_string(),
-            CredentialRecord {
-                token_hash: hash_token(token),
-                created_at: 1,
-                rotated_at: None,
-                revoked_at: None,
-            },
-        );
+        let credential_path = spool_path.with_extension("credentials.json");
+        let mut credential_store = credentials::CredentialStore::load(&credential_path)
+            .await
+            .expect("credential store loads");
+        let token = credential_store
+            .create("collector-a")
+            .expect("credential creates");
         let state = AppState {
             legacy_token: None,
-            credentials: Arc::new(Mutex::new(CredentialStore {
-                path: PathBuf::from("collectors.json"),
-                records,
-            })),
+            credentials: Arc::new(Mutex::new(credential_store)),
             spool: Arc::new(Mutex::new(spool)),
             seen: Arc::new(Mutex::new(HashSet::new())),
             rate_windows: Arc::new(Mutex::new(HashMap::new())),
