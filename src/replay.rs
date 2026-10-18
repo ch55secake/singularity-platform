@@ -1,28 +1,24 @@
 use std::{
-    collections::{BTreeMap, HashSet},
+    collections::HashSet,
     env,
     path::{Path, PathBuf},
     time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
-#[cfg(unix)]
-use std::os::unix::fs::PermissionsExt;
-
 use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use tokio::{
-    fs::{self, OpenOptions},
-    io::AsyncWriteExt,
-};
+use tokio::fs;
 
 mod download;
 mod parser;
+mod state;
 
 use download::download_replay;
 #[cfg(test)]
 use download::{decompress_file, decompress_replay, replay_url};
 use parser::{MODEL_VERSION, PARSER_VERSION, parse_replay};
+use state::{ReplayJob, ReplayState, ReplayStatus};
 
 const DEFAULT_SPOOL_PATH: &str = "data/salts.jsonl";
 const DEFAULT_STATE_PATH: &str = "data/replay-state.json";
@@ -40,43 +36,6 @@ struct ReplayRecord {
     match_id: u64,
     cluster_id: Option<u32>,
     replay_salt: Option<u32>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-enum ReplayStatus {
-    #[serde(rename = "replay_pending")]
-    Pending,
-    #[serde(rename = "replay_downloaded")]
-    Downloaded,
-    #[serde(rename = "replay_parsed")]
-    Parsed,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-struct ReplayJob {
-    status: ReplayStatus,
-    attempts: u32,
-    next_retry_at: Option<u64>,
-    last_error: Option<String>,
-    raw_path: Option<String>,
-    position_count: Option<u32>,
-    #[serde(default)]
-    parser_version: Option<String>,
-    #[serde(default)]
-    raw_retention_until: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-struct ReplayStateFile {
-    version: u32,
-    #[serde(default)]
-    jobs: BTreeMap<String, ReplayJob>,
-}
-
-struct ReplayState {
-    path: PathBuf,
-    jobs: BTreeMap<String, ReplayJob>,
 }
 
 struct ReplayConfig {
@@ -269,72 +228,6 @@ fn non_negative_env(name: &str, default: u64) -> Result<u64, std::io::Error> {
         .map_err(|_| {
             std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid replay setting")
         })
-}
-
-impl ReplayState {
-    async fn load(path: &Path) -> Result<Self, Box<dyn std::error::Error>> {
-        let contents = match fs::read(path).await {
-            Ok(contents) => contents,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Vec::new(),
-            Err(error) => return Err(error.into()),
-        };
-        if contents.is_empty() {
-            return Ok(Self {
-                path: path.to_path_buf(),
-                jobs: BTreeMap::new(),
-            });
-        }
-        #[cfg(unix)]
-        fs::set_permissions(path, std::fs::Permissions::from_mode(0o600)).await?;
-        let file: ReplayStateFile = serde_json::from_slice(&contents)?;
-        if file.version != 1 {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "unsupported replay state version",
-            )
-            .into());
-        }
-        Ok(Self {
-            path: path.to_path_buf(),
-            jobs: file.jobs,
-        })
-    }
-
-    async fn save(&self) -> Result<(), Box<dyn std::error::Error>> {
-        if let Some(parent) = self
-            .path
-            .parent()
-            .filter(|parent| !parent.as_os_str().is_empty())
-        {
-            fs::create_dir_all(parent).await?;
-        }
-        let contents = serde_json::to_vec_pretty(&ReplayStateFile {
-            version: 1,
-            jobs: self.jobs.clone(),
-        })?;
-        let temp_path = self.path.with_file_name(format!(
-            ".{}.tmp-{}-{}",
-            self.path
-                .file_name()
-                .and_then(|name| name.to_str())
-                .unwrap_or("replay-state.json"),
-            std::process::id(),
-            now_nanos()
-        ));
-        let mut temp = OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(&temp_path)
-            .await?;
-        temp.write_all(&contents).await?;
-        temp.flush().await?;
-        temp.sync_data().await?;
-        drop(temp);
-        #[cfg(unix)]
-        fs::set_permissions(&temp_path, std::fs::Permissions::from_mode(0o600)).await?;
-        fs::rename(temp_path, &self.path).await?;
-        Ok(())
-    }
 }
 
 async fn process_record(
@@ -689,9 +582,10 @@ fn now_nanos() -> u128 {
 mod tests {
     use super::*;
     use bzip2::{Compression, write::BzEncoder};
+    use std::collections::BTreeMap;
     use std::fs as std_fs;
     use std::io::{Cursor, Write};
-    use tokio::io::AsyncReadExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
     fn sample_record() -> ReplayRecord {
