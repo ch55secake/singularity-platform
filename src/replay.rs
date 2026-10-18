@@ -6,14 +6,16 @@ use std::{
 };
 
 use reqwest::Client;
-use serde::{Deserialize, Serialize};
+use serde::Deserialize;
 use sha2::{Digest, Sha256};
 use tokio::fs;
 
+mod clickhouse;
 mod download;
 mod parser;
 mod state;
 
+use clickhouse::{ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS, ReplayMatchRow};
 use download::download_replay;
 #[cfg(test)]
 use download::{decompress_file, decompress_replay, replay_url};
@@ -50,24 +52,6 @@ struct ReplayConfig {
     max_decompressed_bytes: u64,
     max_disk_bytes: u64,
     debug_retention_seconds: u64,
-}
-
-struct ClickHouseClient {
-    http: Client,
-    url: String,
-    database: String,
-    user: Option<String>,
-    password: Option<String>,
-}
-
-#[derive(Debug, Clone, Serialize)]
-struct ReplayMatchRow {
-    match_id: u64,
-    replay_job_id: String,
-    parser_version: String,
-    parsed_at: u64,
-    position_count: u32,
-    model_version: u64,
 }
 
 #[derive(Default)]
@@ -443,11 +427,6 @@ async fn remove_raw_file(raw_path: Option<&str>) -> Result<(), Box<dyn std::erro
     }
 }
 
-const REPLAY_MATCH_COLUMNS: &str =
-    "match_id, replay_job_id, parser_version, parsed_at, position_count, model_version";
-const REPLAY_POSITION_COLUMNS: &str =
-    "match_id, entity_index, tick, time_s, x, y, z, parser_version, model_version";
-
 async fn record_failure(
     state: &mut ReplayState,
     job_id: &str,
@@ -488,63 +467,6 @@ async fn disk_usage(path: &Path) -> Result<u64, std::io::Error> {
         }
     }
     Ok(total)
-}
-
-impl ClickHouseClient {
-    fn from_env(timeout: &Duration) -> Result<Self, std::io::Error> {
-        let url = env::var("SINGULARITY_CLICKHOUSE_URL").map_err(|_| {
-            std::io::Error::new(
-                std::io::ErrorKind::InvalidInput,
-                "SINGULARITY_CLICKHOUSE_URL is required for replay-worker",
-            )
-        })?;
-        let http = Client::builder()
-            .timeout(*timeout)
-            .build()
-            .map_err(std::io::Error::other)?;
-        Ok(Self {
-            http,
-            url,
-            database: env::var("SINGULARITY_CLICKHOUSE_DATABASE")
-                .unwrap_or_else(|_| "singularity".to_string()),
-            user: env::var("SINGULARITY_CLICKHOUSE_USER").ok(),
-            password: env::var("SINGULARITY_CLICKHOUSE_PASSWORD").ok(),
-        })
-    }
-
-    async fn insert<T: Serialize>(
-        &self,
-        table: &str,
-        columns: &str,
-        rows: &[T],
-    ) -> Result<(), Box<dyn std::error::Error>> {
-        if rows.is_empty() {
-            return Ok(());
-        }
-        let mut body = Vec::new();
-        for row in rows {
-            serde_json::to_writer(&mut body, row)?;
-            body.push(b'\n');
-        }
-        let query = format!(
-            "INSERT INTO {}.{} ({}) FORMAT JSONEachRow",
-            self.database, table, columns
-        );
-        let mut request = self
-            .http
-            .post(&self.url)
-            .query(&[("query", query)])
-            .header("content-type", "application/json")
-            .body(body);
-        if let Some(user) = &self.user {
-            request = request.basic_auth(user, self.password.as_deref());
-        }
-        let response = request.send().await?;
-        if !response.status().is_success() {
-            return Err(std::io::Error::other("ClickHouse insert failed").into());
-        }
-        Ok(())
-    }
 }
 
 fn job_id(record: &ReplayRecord) -> String {
