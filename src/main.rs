@@ -15,12 +15,11 @@ mod rate_limit;
 mod read_api;
 mod replay;
 mod salt_spool;
+mod server;
 mod server_config;
 
 use commands::{Command, parse_command};
 use salt_spool::{SaltKey, SaltRecord};
-use server_config::MAX_REQUEST_BODY_BYTES;
-
 use std::{
     collections::HashSet,
     env,
@@ -31,10 +30,9 @@ use std::{
 };
 
 use axum::{
-    Json, Router,
-    extract::{DefaultBodyLimit, State},
+    Json,
+    extract::State,
     http::{HeaderMap, StatusCode},
-    routing::{get, post},
 };
 use serde::Serialize;
 use subtle::ConstantTimeEq;
@@ -141,43 +139,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         live: Arc::new(Mutex::new(live_store)),
     };
     tokio::spawn(live::fetch_salts(state.clone()));
-    let app = Router::new()
-        .route("/health", get(health))
-        .route("/ingest/salts", post(ingest_salts))
-        .route("/ingest/live", post(live::report))
-        // Not under /api: the web app proxies /api to browsers, and this list
-        // carries Steam account IDs for the Discord bot.
-        .route("/live", get(live::list))
-        .route("/matches", get(read_api::list_matches))
-        .route("/sessions", get(read_api::list_sessions))
-        .route("/events/matches", get(read_api::list_processed_events))
-        .route("/matches/{identifier}", get(read_api::get_match))
-        .route(
-            "/matches/{identifier}/positions",
-            get(read_api::get_positions),
-        )
-        .route("/matches/{identifier}/deaths", get(read_api::get_deaths))
-        .route("/api/matches", get(read_api::list_matches))
-        .route("/api/sessions", get(read_api::list_sessions))
-        .route("/api/events/matches", get(read_api::list_processed_events))
-        .route("/api/matches/{identifier}", get(read_api::get_match))
-        .route(
-            "/api/matches/{identifier}/positions",
-            get(read_api::get_positions),
-        )
-        .route(
-            "/api/matches/{identifier}/deaths",
-            get(read_api::get_deaths),
-        )
-        .route("/players/{account_id}", get(read_api::get_player))
-        .route("/api/players/{account_id}", get(read_api::get_player))
-        .route("/players/by-name/{name}", get(read_api::get_player_by_name))
-        .route(
-            "/api/players/by-name/{name}",
-            get(read_api::get_player_by_name),
-        )
-        .layer(DefaultBodyLimit::max(MAX_REQUEST_BODY_BYTES))
-        .with_state(state);
+    let app = server::router(state);
 
     let bind = env::var("SINGULARITY_BIND").unwrap_or_else(|_| DEFAULT_BIND.to_string());
     let address: SocketAddr = bind.parse()?;
