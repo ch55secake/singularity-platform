@@ -8,6 +8,7 @@ mod credentials;
 mod discord;
 mod discord_format;
 mod discord_live;
+mod ingest;
 mod live;
 mod metadata;
 mod parser;
@@ -19,7 +20,7 @@ mod server;
 mod server_config;
 
 use commands::{Command, parse_command};
-use salt_spool::{SaltKey, SaltRecord};
+use salt_spool::SaltKey;
 use std::{
     collections::HashSet,
     env,
@@ -29,11 +30,7 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use axum::{
-    Json,
-    extract::State,
-    http::{HeaderMap, StatusCode},
-};
+use axum::{Json, http::StatusCode};
 use serde::Serialize;
 use subtle::ConstantTimeEq;
 use tokio::{
@@ -63,12 +60,6 @@ struct AppState {
 #[derive(Debug, Serialize)]
 struct ErrorBody {
     error: &'static str,
-}
-
-#[derive(Debug, Serialize)]
-struct IngestBody {
-    accepted: usize,
-    duplicates: usize,
 }
 
 #[tokio::main]
@@ -157,66 +148,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
-async fn health() -> Json<serde_json::Value> {
-    Json(serde_json::json!({
-        "service": "singularity-platform",
-        "status": "ok",
-        "baseline": "v0.1.0",
-    }))
-}
-
-async fn ingest_salts(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(mut records): Json<Vec<SaltRecord>>,
-) -> Result<Json<IngestBody>, (StatusCode, Json<ErrorBody>)> {
-    let Some(collector_id) = auth::authenticate(&headers, &state).await else {
-        return Err((
-            StatusCode::UNAUTHORIZED,
-            Json(ErrorBody {
-                error: "unauthorized",
-            }),
-        ));
-    };
-    if !allow_request(&state, &collector_id).await {
-        return Err((
-            StatusCode::TOO_MANY_REQUESTS,
-            Json(ErrorBody {
-                error: "collector request rate limit exceeded",
-            }),
-        ));
-    }
-    if records.is_empty() || records.len() > state.max_batch_size {
-        return Err((
-            StatusCode::BAD_REQUEST,
-            Json(ErrorBody {
-                error: "batch exceeds the configured collector limit",
-            }),
-        ));
-    }
-
-    for record in &records {
-        if !salt_spool::valid_record(record) {
-            return Err((
-                StatusCode::BAD_REQUEST,
-                Json(ErrorBody {
-                    error: "invalid match salt record",
-                }),
-            ));
-        }
-    }
-
-    for record in &mut records {
-        record.collector_id = Some(collector_id.clone());
-    }
-
-    let (accepted, duplicates) = salt_spool::store_records(&state, records).await?;
-    Ok(Json(IngestBody {
-        accepted,
-        duplicates,
-    }))
-}
-
 fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
     bool::from(left.ct_eq(right))
 }
@@ -245,6 +176,11 @@ fn internal_error() -> (StatusCode, Json<ErrorBody>) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::{
+        extract::State,
+        http::{HeaderMap, header::AUTHORIZATION},
+    };
+    use salt_spool::SaltRecord;
 
     fn sample_record() -> SaltRecord {
         SaltRecord {
@@ -259,7 +195,6 @@ mod tests {
 
     #[tokio::test]
     async fn authenticated_replays_are_deduplicated_and_attributed() {
-        use axum::http::header::AUTHORIZATION;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let spool_path = env::temp_dir().join(format!(
@@ -311,14 +246,14 @@ mod tests {
 
         let mut submitted_record = sample_record();
         submitted_record.collector_id = Some("spoofed-collector".to_string());
-        let first = ingest_salts(
+        let first = ingest::ingest_salts(
             State(state.clone()),
             headers.clone(),
             Json(vec![submitted_record.clone()]),
         )
         .await
         .expect("first request succeeds");
-        let second = ingest_salts(State(state), headers, Json(vec![submitted_record]))
+        let second = ingest::ingest_salts(State(state), headers, Json(vec![submitted_record]))
             .await
             .expect("replayed request succeeds");
 
