@@ -6,6 +6,8 @@
 //! the platform asks the community Deadlock API for its salts, so the match is
 //! processed even when nobody opens it in the in-game match history.
 
+mod community_api;
+
 use std::{
     collections::{BTreeMap, BTreeSet},
     env,
@@ -29,11 +31,9 @@ use tracing::{info, warn};
 use crate::auth::authenticate;
 use crate::{
     AppState, ErrorBody, allow_request, internal_error, now_seconds, read_api,
-    salt_spool::{MAX_MATCH_ID, SaltRecord, store_records},
+    salt_spool::{MAX_MATCH_ID, store_records},
 };
 
-const DEFAULT_DEADLOCK_API_URL: &str = "https://api.deadlock-api.com";
-const SALTS_COLLECTOR_ID: &str = "community-api";
 /// Reports older than this are dropped on restart.
 const RETENTION_SECONDS: u64 = 24 * 60 * 60;
 /// The default window for `GET /live`.
@@ -47,9 +47,6 @@ pub(crate) const CANCELLED_WITHIN_SECONDS: u64 = 5 * 60;
 const ASSUMED_LENGTH_SECONDS: u64 = 45 * 60;
 /// Stop asking for a match's salts this long after it was first reported.
 const GIVE_UP_SECONDS: u64 = 4 * 60 * 60;
-/// Salts that the community API must fetch from Steam are limited to 10 per
-/// 30 minutes per IP, so requests are spaced out across all matches.
-const MIN_REQUEST_GAP_SECONDS: u64 = 180;
 const TICK: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -106,17 +103,6 @@ pub(crate) struct ListQuery {
 #[derive(Debug, Serialize)]
 pub(crate) struct AcceptedBody {
     accepted: bool,
-}
-
-#[derive(Debug, Deserialize)]
-struct SaltsResponse {
-    match_id: u64,
-    #[serde(default)]
-    cluster_id: Option<u32>,
-    #[serde(default)]
-    metadata_salt: Option<u32>,
-    #[serde(default)]
-    replay_salt: Option<u32>,
 }
 
 impl LiveMatch {
@@ -317,10 +303,7 @@ pub(crate) async fn fetch_salts(state: AppState) {
     if !enabled {
         return;
     }
-    let base_url = env::var("SINGULARITY_DEADLOCK_API_URL")
-        .unwrap_or_else(|_| DEFAULT_DEADLOCK_API_URL.to_string())
-        .trim_end_matches('/')
-        .to_string();
+    let base_url = community_api::configured_base_url();
     let Ok(http) = Client::builder()
         .timeout(Duration::from_secs(30))
         .user_agent("singularity-platform/0.1")
@@ -340,9 +323,9 @@ pub(crate) async fn fetch_salts(state: AppState) {
         let Some(match_id) = next_match(&state, now).await else {
             continue;
         };
-        not_before = now + MIN_REQUEST_GAP_SECONDS;
+        not_before = now + community_api::MIN_REQUEST_GAP_SECONDS;
         info!(match_id, "asking the community API for salts");
-        match request_salts(&http, &base_url, match_id).await {
+        match community_api::request_salts(&http, &base_url, match_id).await {
             Ok(Some(record)) => {
                 let stored = store_records(&state, vec![record]).await;
                 match stored {
@@ -357,16 +340,16 @@ pub(crate) async fn fetch_salts(state: AppState) {
                 info!(match_id, "community API has no salts yet; will retry");
                 retry_later(&state, match_id, now).await;
             }
-            Err(RequestError::Busy(wait)) => {
+            Err(community_api::RequestError::Busy(wait)) => {
                 warn!(
                     match_id,
                     retry_after_seconds = wait,
                     "community API says Steam is busy; waiting before the next salt request"
                 );
-                not_before = now + wait.max(MIN_REQUEST_GAP_SECONDS);
+                not_before = now + wait.max(community_api::MIN_REQUEST_GAP_SECONDS);
                 retry_later(&state, match_id, now).await;
             }
-            Err(RequestError::Other(error)) => {
+            Err(community_api::RequestError::Other(error)) => {
                 warn!(match_id, %error, "salt request failed");
                 retry_later(&state, match_id, now).await;
             }
@@ -437,61 +420,6 @@ async fn retry_later(state: &AppState, match_id: u64, now: u64) {
 
 fn retry_delay(attempts: u32) -> u64 {
     (180 * u64::from(attempts)).min(900)
-}
-
-enum RequestError {
-    /// The API asked us to wait this many seconds.
-    Busy(u64),
-    Other(String),
-}
-
-async fn request_salts(
-    http: &Client,
-    base_url: &str,
-    match_id: u64,
-) -> Result<Option<SaltRecord>, RequestError> {
-    let response = http
-        .get(format!("{base_url}/v1/matches/{match_id}/salts"))
-        .send()
-        .await
-        .map_err(|error| RequestError::Other(error.to_string()))?;
-    let status = response.status();
-    if status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::SERVICE_UNAVAILABLE {
-        let wait = response
-            .headers()
-            .get(reqwest::header::RETRY_AFTER)
-            .and_then(|value| value.to_str().ok())
-            .and_then(|value| value.trim().parse::<u64>().ok())
-            .unwrap_or(MIN_REQUEST_GAP_SECONDS);
-        return Err(RequestError::Busy(wait));
-    }
-    if status == StatusCode::NOT_FOUND {
-        return Ok(None);
-    }
-    if !status.is_success() {
-        return Err(RequestError::Other(format!("HTTP {status}")));
-    }
-    let body = response
-        .bytes()
-        .await
-        .map_err(|error| RequestError::Other(error.to_string()))?;
-    let salts = serde_json::from_slice::<SaltsResponse>(&body)
-        .map_err(|error| RequestError::Other(error.to_string()))?;
-    Ok(salts_record(salts, match_id))
-}
-
-fn salts_record(salts: SaltsResponse, match_id: u64) -> Option<SaltRecord> {
-    if salts.match_id != match_id || salts.metadata_salt.is_none() {
-        return None;
-    }
-    Some(SaltRecord {
-        match_id,
-        cluster_id: salts.cluster_id,
-        metadata_salt: salts.metadata_salt,
-        replay_salt: salts.replay_salt,
-        username: None,
-        collector_id: Some(SALTS_COLLECTOR_ID.to_string()),
-    })
 }
 
 #[cfg(test)]
@@ -571,21 +499,6 @@ mod tests {
         assert_eq!(retry_delay(1), 180);
         assert_eq!(retry_delay(3), 540);
         assert_eq!(retry_delay(10), 900);
-    }
-
-    #[test]
-    fn only_complete_salts_become_records() {
-        let salts = |match_id, metadata_salt| SaltsResponse {
-            match_id,
-            cluster_id: Some(390),
-            metadata_salt,
-            replay_salt: Some(9),
-        };
-        let record = salts_record(salts(5, Some(7)), 5).unwrap();
-        assert_eq!(record.metadata_salt, Some(7));
-        assert_eq!(record.collector_id.as_deref(), Some(SALTS_COLLECTOR_ID));
-        assert!(salts_record(salts(5, None), 5).is_none());
-        assert!(salts_record(salts(6, Some(7)), 5).is_none());
     }
 
     #[tokio::test]
