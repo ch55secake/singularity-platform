@@ -4,7 +4,7 @@ use bzip2::read::BzDecoder;
 use reqwest::{Client, StatusCode};
 use zstd::stream::read::Decoder as ZstdDecoder;
 
-use super::{MetadataRecord, WorkerConfig};
+use super::{MetadataRecord, config::WorkerConfig};
 
 const MAX_COMPRESSED_BYTES: u64 = 16 * 1024 * 1024;
 const MAX_DECOMPRESSED_BYTES: u64 = 64 * 1024 * 1024;
