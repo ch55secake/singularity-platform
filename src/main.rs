@@ -2,6 +2,7 @@
 #![deny(clippy::all)]
 
 mod assets;
+mod auth;
 mod commands;
 mod credentials;
 mod discord;
@@ -30,7 +31,7 @@ use std::{
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, State},
-    http::{HeaderMap, StatusCode, header::AUTHORIZATION},
+    http::{HeaderMap, StatusCode},
     routing::{get, post},
 };
 use serde::Serialize;
@@ -47,9 +48,6 @@ const DEFAULT_SPOOL: &str = "data/salts.jsonl";
 const DEFAULT_CREDENTIALS: &str = "data/collectors.json";
 const MAX_BATCH_SIZE: usize = 1_000;
 const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024;
-const LEGACY_COLLECTOR_ID: &str = "legacy-global-token";
-const ANONYMOUS_COLLECTOR_ID: &str = "anonymous-development";
-
 #[derive(Clone)]
 struct AppState {
     legacy_token: Option<String>,
@@ -210,7 +208,7 @@ async fn ingest_salts(
     headers: HeaderMap,
     Json(mut records): Json<Vec<SaltRecord>>,
 ) -> Result<Json<IngestBody>, (StatusCode, Json<ErrorBody>)> {
-    let Some(collector_id) = authenticate(&headers, &state).await else {
+    let Some(collector_id) = auth::authenticate(&headers, &state).await else {
         return Err((
             StatusCode::UNAUTHORIZED,
             Json(ErrorBody {
@@ -268,30 +266,6 @@ fn now_seconds() -> u64 {
         .as_secs()
 }
 
-async fn authenticate(headers: &HeaderMap, state: &AppState) -> Option<String> {
-    if !state.authentication_required {
-        return Some(ANONYMOUS_COLLECTOR_ID.to_string());
-    }
-    let token = bearer_token(headers)?;
-    if let Some(expected) = state.legacy_token.as_deref()
-        && constant_time_eq(token.as_bytes(), expected.as_bytes())
-    {
-        return Some(LEGACY_COLLECTOR_ID.to_string());
-    }
-    state.credentials.lock().await.authenticate(token)
-}
-
-fn bearer_token(headers: &HeaderMap) -> Option<&str> {
-    let value = headers.get(AUTHORIZATION)?.to_str().ok()?;
-    let mut parts = value.split_ascii_whitespace();
-    let scheme = parts.next()?;
-    let token = parts.next()?;
-    if parts.next().is_some() || !scheme.eq_ignore_ascii_case("Bearer") || token.is_empty() {
-        return None;
-    }
-    Some(token)
-}
-
 async fn allow_request(state: &AppState, collector_id: &str) -> bool {
     let mut windows = state.rate_windows.lock().await;
     windows.consume(collector_id, state.rate_limit)
@@ -341,16 +315,9 @@ mod tests {
         }
     }
 
-    #[test]
-    fn malformed_authorization_is_rejected_without_parsing_a_token() {
-        let mut headers = HeaderMap::new();
-        headers.insert(AUTHORIZATION, "Basic not-a-bearer-token".parse().unwrap());
-
-        assert_eq!(bearer_token(&headers), None);
-    }
-
     #[tokio::test]
     async fn authenticated_replays_are_deduplicated_and_attributed() {
+        use axum::http::header::AUTHORIZATION;
         use std::time::{SystemTime, UNIX_EPOCH};
 
         let spool_path = env::temp_dir().join(format!(

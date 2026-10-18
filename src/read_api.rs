@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tracing::warn;
 
-use crate::{ErrorBody, bearer_token, constant_time_eq, non_empty_env};
+use crate::{ErrorBody, auth::bearer_token, constant_time_eq, non_empty_env};
 
 mod impact;
 mod match_context;

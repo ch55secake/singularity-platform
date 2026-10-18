@@ -26,8 +26,9 @@ use tokio::{
 };
 use tracing::{info, warn};
 
+use crate::auth::authenticate;
 use crate::{
-    AppState, ErrorBody, allow_request, authenticate, internal_error, now_seconds, read_api,
+    AppState, ErrorBody, allow_request, internal_error, now_seconds, read_api,
     salt_spool::{MAX_MATCH_ID, SaltRecord, store_records},
 };
 
