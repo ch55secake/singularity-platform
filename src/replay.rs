@@ -1,8 +1,7 @@
 use std::{
     collections::HashSet,
-    env,
-    path::{Path, PathBuf},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    path::Path,
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
@@ -11,47 +10,24 @@ use sha2::{Digest, Sha256};
 use tokio::fs;
 
 mod clickhouse;
+mod config;
 mod download;
 mod parser;
 mod state;
 
 use clickhouse::{ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS, ReplayMatchRow};
+use config::ReplayConfig;
 use download::download_replay;
 #[cfg(test)]
 use download::{decompress_file, decompress_replay, replay_url};
 use parser::{MODEL_VERSION, PARSER_VERSION, parse_replay};
 use state::{ReplayJob, ReplayState, ReplayStatus};
 
-const DEFAULT_SPOOL_PATH: &str = "data/salts.jsonl";
-const DEFAULT_STATE_PATH: &str = "data/replay-state.json";
-const DEFAULT_OUTPUT_DIR: &str = "data/replays";
-const DEFAULT_BASE_URL: &str = "http://replay{cluster}.valve.net/1422450";
-const DEFAULT_TIMEOUT_SECONDS: u64 = 60;
-const DEFAULT_RETRY_BASE_SECONDS: u64 = 30;
-const DEFAULT_RETRY_MAX_SECONDS: u64 = 3_600;
-const DEFAULT_MAX_COMPRESSED_BYTES: u64 = 512 * 1024 * 1024;
-const DEFAULT_MAX_DECOMPRESSED_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-const DEFAULT_MAX_DISK_BYTES: u64 = 32 * 1024 * 1024 * 1024;
-const DEFAULT_DEBUG_RETENTION_SECONDS: u64 = 0;
 #[derive(Debug, Clone, Deserialize)]
 struct ReplayRecord {
     match_id: u64,
     cluster_id: Option<u32>,
     replay_salt: Option<u32>,
-}
-
-struct ReplayConfig {
-    spool_path: PathBuf,
-    state_path: PathBuf,
-    output_dir: PathBuf,
-    base_url: String,
-    timeout: Duration,
-    retry_base_seconds: u64,
-    retry_max_seconds: u64,
-    max_compressed_bytes: u64,
-    max_decompressed_bytes: u64,
-    max_disk_bytes: u64,
-    debug_retention_seconds: u64,
 }
 
 #[derive(Default)]
@@ -134,84 +110,6 @@ impl ReplayRecord {
             && self.cluster_id.is_some_and(|cluster| cluster > 0)
             && self.replay_salt.is_some_and(|salt| salt > 0)
     }
-}
-
-impl ReplayConfig {
-    fn from_env() -> Result<Self, std::io::Error> {
-        let timeout_seconds = positive_env(
-            "SINGULARITY_REPLAY_TIMEOUT_SECONDS",
-            DEFAULT_TIMEOUT_SECONDS,
-        )?;
-        let retry_base_seconds = positive_env(
-            "SINGULARITY_REPLAY_RETRY_BASE_SECONDS",
-            DEFAULT_RETRY_BASE_SECONDS,
-        )?;
-        let retry_max_seconds = positive_env(
-            "SINGULARITY_REPLAY_RETRY_MAX_SECONDS",
-            DEFAULT_RETRY_MAX_SECONDS,
-        )?;
-        Ok(Self {
-            spool_path: PathBuf::from(
-                env::var("SINGULARITY_REPLAY_SPOOL_PATH")
-                    .or_else(|_| env::var("SINGULARITY_SPOOL_PATH"))
-                    .unwrap_or_else(|_| DEFAULT_SPOOL_PATH.to_string()),
-            ),
-            state_path: PathBuf::from(
-                env::var("SINGULARITY_REPLAY_STATE_PATH")
-                    .unwrap_or_else(|_| DEFAULT_STATE_PATH.to_string()),
-            ),
-            output_dir: PathBuf::from(
-                env::var("SINGULARITY_REPLAY_OUTPUT_DIR")
-                    .unwrap_or_else(|_| DEFAULT_OUTPUT_DIR.to_string()),
-            ),
-            base_url: env::var("SINGULARITY_REPLAY_BASE_URL")
-                .unwrap_or_else(|_| DEFAULT_BASE_URL.to_string()),
-            timeout: Duration::from_secs(timeout_seconds),
-            retry_base_seconds,
-            retry_max_seconds: retry_max_seconds.max(retry_base_seconds),
-            max_compressed_bytes: positive_env(
-                "SINGULARITY_REPLAY_MAX_COMPRESSED_BYTES",
-                DEFAULT_MAX_COMPRESSED_BYTES,
-            )?,
-            max_decompressed_bytes: positive_env(
-                "SINGULARITY_REPLAY_MAX_DECOMPRESSED_BYTES",
-                DEFAULT_MAX_DECOMPRESSED_BYTES,
-            )?,
-            max_disk_bytes: positive_env(
-                "SINGULARITY_REPLAY_MAX_DISK_BYTES",
-                DEFAULT_MAX_DISK_BYTES,
-            )?,
-            debug_retention_seconds: non_negative_env(
-                "SINGULARITY_REPLAY_DEBUG_RETENTION_SECONDS",
-                DEFAULT_DEBUG_RETENTION_SECONDS,
-            )?,
-        })
-    }
-}
-
-fn positive_env(name: &str, default: u64) -> Result<u64, std::io::Error> {
-    let value = env::var(name)
-        .unwrap_or_else(|_| default.to_string())
-        .parse::<u64>()
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid replay setting")
-        })?;
-    if value == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "replay setting must be greater than zero",
-        ));
-    }
-    Ok(value)
-}
-
-fn non_negative_env(name: &str, default: u64) -> Result<u64, std::io::Error> {
-    env::var(name)
-        .unwrap_or_else(|_| default.to_string())
-        .parse::<u64>()
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid replay setting")
-        })
 }
 
 async fn process_record(
@@ -507,6 +405,7 @@ mod tests {
     use std::collections::BTreeMap;
     use std::fs as std_fs;
     use std::io::{Cursor, Write};
+    use std::{path::PathBuf, time::Duration};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::TcpListener;
 
