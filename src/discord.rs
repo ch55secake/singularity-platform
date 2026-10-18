@@ -30,7 +30,7 @@ use tokio::{
 };
 use tracing::{info, warn};
 
-use crate::discord_format::{Cell, Column, TEAM_COLOURS, Tone, table};
+use crate::discord_format::{TEAM_COLOURS, safe_embed_text};
 use crate::discord_live::{LiveScout, TEAM_NAMES, live_heading};
 use crate::live::CANCELLED_WITHIN_SECONDS;
 
@@ -1214,7 +1214,7 @@ fn is_transient(error: &(dyn std::error::Error + Send + Sync + 'static)) -> bool
     })
 }
 
-/// " for @a, @b" naming the linked players who reported the match.
+/// Linked players who reported the match, without adding presentation text.
 fn players_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String {
     let mut players = report
         .account_ids
@@ -1224,51 +1224,24 @@ fn players_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String {
         .collect::<Vec<_>>();
     players.sort();
     players.dedup();
-    if players.is_empty() {
-        String::new()
-    } else {
-        format!(" for {}", players.join(", "))
-    }
+    players.join(", ")
 }
 
 /// The first message for a reported match, before the teams are known.
 fn match_found_text(report: &ApiLiveMatch, linked: &HashMap<u32, u64>) -> String {
+    let reporters = players_text(report, linked);
+    let reporters = if reporters.is_empty() {
+        "Scouting the lobby".to_string()
+    } else {
+        format!("Reported by {reporters} · scouting the lobby")
+    };
     format!(
-        "🔍 **Match found**{} · match {} · scouting the lobby, teams appear here a few minutes in",
-        players_text(report, linked),
+        "🔎 **Match found**\nMatch `{}` · {reporters}",
         report.match_id
     )
 }
 
-const SUMMARY_COLUMNS: [Column; 5] = [
-    Column {
-        heading: "Hero",
-        width: 11,
-        right: false,
-    },
-    Column {
-        heading: "Player",
-        width: 10,
-        right: false,
-    },
-    Column {
-        heading: "K/D/A",
-        width: 8,
-        right: true,
-    },
-    Column {
-        heading: "Dmg",
-        width: 6,
-        right: true,
-    },
-    Column {
-        heading: "Acc",
-        width: 4,
-        right: true,
-    },
-];
-
-/// The after-match post: result line, then one coloured table per team.
+/// The after-match post: result line, then one player card per team member.
 fn match_post(
     detail: &ApiMatchDetail,
     played_by: &[u64],
@@ -1291,25 +1264,28 @@ fn match_post(
     let result = if our_teams.is_empty() {
         "🏁 **Match complete**"
     } else if our_teams.contains(&detail.winning_team) {
-        "✅ **Win**"
+        "✅ **Victory**"
     } else {
-        "❌ **Loss**"
+        "❌ **Defeat**"
     };
-    let played_by = if played_by.is_empty() {
-        String::new()
-    } else {
+    let mut details = Vec::new();
+    if !played_by.is_empty() {
         let users = played_by
             .iter()
             .map(|user| format!("<@{user}>"))
             .collect::<Vec<_>>();
-        format!(" for {}", users.join(", "))
-    };
-    let content = format!(
-        "{result}{played_by} · {} · {} · [full match on Singularity](<{}/m/{}>)",
-        detail.mode,
-        format_duration(detail.duration_s),
+        details.push(format!("👥 {}", users.join(", ")));
+    }
+    details.push(format!(
+        "[View full match](<{}/m/{}>)",
         web_url.trim_end_matches('/'),
         detail.uuid
+    ));
+    let content = format!(
+        "{result} · **{}** · {}\n{}",
+        detail.mode,
+        format_duration(detail.duration_s),
+        details.join(" · ")
     );
 
     let top_damage = detail
@@ -1334,21 +1310,42 @@ fn match_post(
             if players.is_empty() {
                 return None;
             }
-            let rows = players
-                .iter()
-                .map(|player| summary_row(player, friend_of(player), top_damage))
-                .collect::<Vec<_>>();
             let index = usize::try_from(team).unwrap_or_default().min(1);
             let mut title = TEAM_NAMES[index].to_string();
+            let badge = if index == 0 { "🟠" } else { "🔵" };
             if team == detail.winning_team {
-                title = format!("🏆 {title} · Victory");
+                title = format!("{badge} {title} · Victory 🏆");
+            } else {
+                title = format!("{badge} {title}");
             }
-            Some(
-                CreateEmbed::new()
-                    .title(title)
-                    .colour(TEAM_COLOURS[index])
-                    .description(table(&SUMMARY_COLUMNS, &rows)),
-            )
+            let mut embed = CreateEmbed::new().title(title).colour(TEAM_COLOURS[index]);
+            for player in players {
+                let hero = safe_embed_text(&player.hero.name, 80);
+                let player_name = friend_of(player)
+                    .filter(|name| !name.trim().is_empty())
+                    .map(|name| safe_embed_text(&name, 96));
+                let field_name = player_name
+                    .map(|name| format!("{hero} · {name}"))
+                    .unwrap_or(hero);
+                let shots = player.aim.shots_hit + player.aim.shots_missed;
+                let aim = if shots > 0 {
+                    format!("{:.0}%", accuracy(player) * 100.0)
+                } else {
+                    "—".to_string()
+                };
+                let damage = format_thousands(player.hero_damage);
+                let damage = if player.hero_damage == top_damage && top_damage > 0 {
+                    format!("💥 Top damage · **{damage}**")
+                } else {
+                    format!("Damage · **{damage}**")
+                };
+                let value = format!(
+                    "K/D/A · **{} / {} / {}**\n{damage} · Accuracy · **{aim}**",
+                    player.kills, player.deaths, player.assists
+                );
+                embed = embed.field(field_name, value, true);
+            }
+            Some(embed)
         })
         .collect::<Vec<_>>();
     let embeds = match embeds.split_last() {
@@ -1357,7 +1354,7 @@ fn match_post(
             embeds.push(
                 last.clone()
                     .footer(serenity::all::CreateEmbedFooter::new(format!(
-                        "Match {} · Dmg: hero damage, top in yellow · Acc: shot accuracy",
+                        "Match {} · K/D/A: kills / deaths / assists · Accuracy: shots hit / shots fired",
                         detail.match_id
                     ))),
             );
@@ -1366,37 +1363,6 @@ fn match_post(
         None => embeds,
     };
     Post { content, embeds }
-}
-
-fn summary_row(player: &ApiDetailPlayer, friend: Option<String>, top_damage: u32) -> Vec<Cell> {
-    let kda = f64::from(player.kills + player.assists) / f64::from(player.deaths.max(1));
-    let kda_tone = if kda >= 3.0 {
-        Tone::Good
-    } else if kda < 1.5 {
-        Tone::Bad
-    } else {
-        Tone::Middling
-    };
-    let shots = player.aim.shots_hit + player.aim.shots_missed;
-    let damage_tone = if player.hero_damage == top_damage && top_damage > 0 {
-        Tone::Highlight
-    } else {
-        Tone::Plain
-    };
-    vec![
-        Cell::plain(player.hero.name.as_str()),
-        friend.map_or_else(Cell::empty, |name| Cell::new(name, Tone::Friend)),
-        Cell::new(
-            format!("{}/{}/{}", player.kills, player.deaths, player.assists),
-            kda_tone,
-        ),
-        Cell::new(format_thousands(player.hero_damage), damage_tone),
-        if shots > 0 {
-            Cell::plain(format!("{:.0}%", accuracy(player) * 100.0))
-        } else {
-            Cell::new("-", Tone::Muted)
-        },
-    ]
 }
 
 /// 47104 -> "47.1k".
@@ -1670,15 +1636,26 @@ mod tests {
 
         assert_eq!(
             post.content,
-            "❌ **Loss** for <@5> · 6v6 · 31:50 · [full match on Singularity](<http://rake/m/abc>)"
+            "❌ **Defeat** · **6v6** · 31:50\n👥 <@5> · [View full match](<http://rake/m/abc>)"
         );
         let embeds = serde_json::to_value(&post.embeds).unwrap();
-        assert_eq!(embeds[0]["title"], "Sapphire Flame");
-        assert_eq!(embeds[1]["title"], "🏆 Amber Hand · Victory");
-        let ours = embeds[0]["description"].as_str().unwrap();
-        assert!(ours.contains("\u{1b}[1;36mhobnobs"));
-        assert!(ours.contains("\u{1b}[1;33m 47.1k"));
-        assert!(ours.contains("8/2/9"));
+        assert_eq!(embeds[0]["title"], "🔵 Archmother");
+        assert_eq!(embeds[1]["title"], "🟠 Hidden King · Victory 🏆");
+        let ours = &embeds[0]["fields"][0];
+        assert_eq!(ours["name"], "Vyper · hobnobs");
+        assert!(
+            ours["value"]
+                .as_str()
+                .unwrap()
+                .contains("Top damage · **47.1k**")
+        );
+        assert!(ours["value"].as_str().unwrap().contains("8 / 2 / 9"));
+        assert!(
+            embeds[1]["fields"][0]["value"]
+                .as_str()
+                .unwrap()
+                .contains("Accuracy · **30%**")
+        );
         assert!(
             embeds[1]["footer"]["text"]
                 .as_str()
@@ -1734,7 +1711,7 @@ mod tests {
         let linked = HashMap::from([(1, 10), (3, 30)]);
         assert_eq!(
             match_found_text(&report, &linked),
-            "🔍 **Match found** for <@10>, <@30> · match 42 · scouting the lobby, teams appear here a few minutes in"
+            "🔎 **Match found**\nMatch `42` · Reported by <@10>, <@30> · scouting the lobby"
         );
     }
 
