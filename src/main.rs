@@ -10,18 +10,19 @@ mod discord_live;
 mod live;
 mod metadata;
 mod parser;
+mod rate_limit;
 mod read_api;
 mod replay;
 
 use commands::{Command, parse_command};
 
 use std::{
-    collections::{HashMap, HashSet},
+    collections::HashSet,
     env,
     net::SocketAddr,
     path::{Path, PathBuf},
     sync::Arc,
-    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use axum::{
@@ -46,8 +47,6 @@ const DEFAULT_CREDENTIALS: &str = "data/collectors.json";
 const MAX_BATCH_SIZE: usize = 1_000;
 const MAX_REQUEST_BODY_BYTES: usize = 512 * 1024;
 const MAX_MATCH_ID: u64 = 10_000_000_000;
-const DEFAULT_RATE_LIMIT: u32 = 60;
-const DEFAULT_RATE_WINDOW_SECONDS: u64 = 60;
 const LEGACY_COLLECTOR_ID: &str = "legacy-global-token";
 const ANONYMOUS_COLLECTOR_ID: &str = "anonymous-development";
 
@@ -57,8 +56,8 @@ struct AppState {
     credentials: Arc<Mutex<credentials::CredentialStore>>,
     spool: Arc<Mutex<tokio::fs::File>>,
     seen: Arc<Mutex<HashSet<SaltKey>>>,
-    rate_windows: Arc<Mutex<HashMap<String, RateWindow>>>,
-    rate_limit: RateLimit,
+    rate_windows: Arc<Mutex<rate_limit::Windows>>,
+    rate_limit: rate_limit::RateLimit,
     max_batch_size: usize,
     authentication_required: bool,
     read_api: read_api::ReadApiState,
@@ -74,18 +73,6 @@ struct SaltRecord {
     username: Option<String>,
     #[serde(default)]
     collector_id: Option<String>,
-}
-
-#[derive(Debug, Clone, Copy)]
-struct RateLimit {
-    max_requests: u32,
-    window: Duration,
-}
-
-#[derive(Debug)]
-struct RateWindow {
-    started_at: Instant,
-    requests: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
@@ -168,7 +155,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         warn!("no ingestion credentials configured; authentication is disabled for development");
     }
     let max_batch_size = configured_batch_size()?;
-    let rate_limit = configured_rate_limit()?;
+    let rate_limit = rate_limit::configured_rate_limit()?;
     let read_api = read_api::ReadApiState::from_env()?;
     let live_path = live::store_path(&spool_path);
     let live_store = live::LiveStore::load(&live_path).await?;
@@ -178,7 +165,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         credentials: Arc::new(Mutex::new(credential_store)),
         spool: Arc::new(Mutex::new(spool)),
         seen: Arc::new(Mutex::new(seen)),
-        rate_windows: Arc::new(Mutex::new(HashMap::new())),
+        rate_windows: Arc::new(Mutex::new(rate_limit::Windows::default())),
         rate_limit,
         max_batch_size,
         authentication_required,
@@ -409,30 +396,7 @@ fn bearer_token(headers: &HeaderMap) -> Option<&str> {
 
 async fn allow_request(state: &AppState, collector_id: &str) -> bool {
     let mut windows = state.rate_windows.lock().await;
-    consume_rate_limit(&mut windows, collector_id, state.rate_limit)
-}
-
-fn consume_rate_limit(
-    windows: &mut HashMap<String, RateWindow>,
-    collector_id: &str,
-    rate_limit: RateLimit,
-) -> bool {
-    let now = Instant::now();
-    let window = windows
-        .entry(collector_id.to_string())
-        .or_insert(RateWindow {
-            started_at: now,
-            requests: 0,
-        });
-    if now.duration_since(window.started_at) >= rate_limit.window {
-        window.started_at = now;
-        window.requests = 0;
-    }
-    if window.requests >= rate_limit.max_requests {
-        return false;
-    }
-    window.requests += 1;
-    true
+    windows.consume(collector_id, state.rate_limit)
 }
 
 fn non_empty_env(name: &str) -> Option<String> {
@@ -453,29 +417,6 @@ fn configured_batch_size() -> Result<usize, std::io::Error> {
         ));
     }
     Ok(value)
-}
-
-fn configured_rate_limit() -> Result<RateLimit, std::io::Error> {
-    let max_requests = env::var("SINGULARITY_COLLECTOR_RATE_LIMIT")
-        .unwrap_or_else(|_| DEFAULT_RATE_LIMIT.to_string())
-        .parse::<u32>()
-        .map_err(|_| std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rate limit"))?;
-    let window_seconds = env::var("SINGULARITY_COLLECTOR_RATE_WINDOW_SECONDS")
-        .unwrap_or_else(|_| DEFAULT_RATE_WINDOW_SECONDS.to_string())
-        .parse::<u64>()
-        .map_err(|_| {
-            std::io::Error::new(std::io::ErrorKind::InvalidInput, "invalid rate window")
-        })?;
-    if max_requests == 0 || window_seconds == 0 {
-        return Err(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "rate limit and window must be greater than zero",
-        ));
-    }
-    Ok(RateLimit {
-        max_requests,
-        window: Duration::from_secs(window_seconds),
-    })
 }
 
 fn valid_record(record: &SaltRecord) -> bool {
@@ -565,20 +506,6 @@ mod tests {
         assert_eq!(bearer_token(&headers), None);
     }
 
-    #[test]
-    fn rate_limits_are_isolated_per_collector() {
-        let mut windows = HashMap::new();
-        let limit = RateLimit {
-            max_requests: 2,
-            window: Duration::from_secs(60),
-        };
-
-        assert!(consume_rate_limit(&mut windows, "collector-a", limit));
-        assert!(consume_rate_limit(&mut windows, "collector-a", limit));
-        assert!(!consume_rate_limit(&mut windows, "collector-a", limit));
-        assert!(consume_rate_limit(&mut windows, "collector-b", limit));
-    }
-
     #[tokio::test]
     async fn authenticated_replays_are_deduplicated_and_attributed() {
         use std::time::{SystemTime, UNIX_EPOCH};
@@ -610,10 +537,10 @@ mod tests {
             credentials: Arc::new(Mutex::new(credential_store)),
             spool: Arc::new(Mutex::new(spool)),
             seen: Arc::new(Mutex::new(HashSet::new())),
-            rate_windows: Arc::new(Mutex::new(HashMap::new())),
-            rate_limit: RateLimit {
+            rate_windows: Arc::new(Mutex::new(rate_limit::Windows::default())),
+            rate_limit: rate_limit::RateLimit {
                 max_requests: 10,
-                window: Duration::from_secs(60),
+                window: std::time::Duration::from_secs(60),
             },
             max_batch_size: MAX_BATCH_SIZE,
             authentication_required: true,
