@@ -1,17 +1,23 @@
 use axum::{
-    Router,
+    Json, Router,
     extract::DefaultBodyLimit,
     routing::{get, post},
 };
 
-use crate::{
-    AppState, health, ingest_salts, live, read_api, server_config::MAX_REQUEST_BODY_BYTES,
-};
+use crate::{AppState, ingest, live, read_api, server_config::MAX_REQUEST_BODY_BYTES};
+
+async fn health() -> Json<serde_json::Value> {
+    Json(serde_json::json!({
+        "service": "singularity-platform",
+        "status": "ok",
+        "baseline": "v0.1.0",
+    }))
+}
 
 pub(super) fn router(state: AppState) -> Router {
     Router::new()
         .route("/health", get(health))
-        .route("/ingest/salts", post(ingest_salts))
+        .route("/ingest/salts", post(ingest::ingest_salts))
         .route("/ingest/live", post(live::report))
         // Not under /api: the web app proxies /api to browsers, and this list
         // carries Steam account IDs for the Discord bot.
