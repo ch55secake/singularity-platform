@@ -92,8 +92,16 @@ The read API is available after applying the match and asset schemas:
 ```bash
 curl http://127.0.0.1:8080/api/matches
 curl http://127.0.0.1:8080/api/matches/<uuid>
+curl http://127.0.0.1:8080/api/matches/<uuid>/lane-stats
 curl http://127.0.0.1:8080/api/players/by-name/<member-name>
 ```
+
+The lane-stats endpoint summarizes each player's latest recorded cumulative
+stats at or before 10:00, reports the actual snapshot time, and includes hero
+deaths recorded during that window. `souls.net_worth` is held net worth;
+`souls.lane_creeps` and the other source fields are the corresponding
+match-stat soul-source totals, not a calculation of unspent souls. Missing
+snapshot values remain `null`.
 
 Set `SINGULARITY_READ_TOKEN` to protect reads with a separate bearer token.
 Use `SINGULARITY_MEMBER_NAMES_JSON` to resolve consenting friends' account IDs

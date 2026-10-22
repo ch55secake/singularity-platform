@@ -11,6 +11,7 @@ use crate::{ErrorBody, auth::bearer_token, constant_time_eq, server_config::non_
 
 mod clickhouse;
 mod impact;
+mod lane_stats;
 mod match_context;
 mod match_detail;
 mod matches;
@@ -21,6 +22,7 @@ use clickhouse::ClickHouseClient;
 use impact::{
     IMPACT_SCORE_VERSION, ImpactMetrics, ImpactScore, calculate_impact_scores, round_score,
 };
+pub(crate) use lane_stats::get_lane_stats;
 pub(crate) use match_context::{get_deaths, get_positions};
 pub(crate) use match_detail::get_match;
 pub(crate) use matches::{list_matches, list_processed_events};
