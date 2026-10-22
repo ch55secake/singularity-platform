@@ -31,6 +31,10 @@ pub(super) fn router(state: AppState) -> Router {
             get(read_api::get_positions),
         )
         .route("/matches/{identifier}/deaths", get(read_api::get_deaths))
+        .route(
+            "/matches/{identifier}/lane-stats",
+            get(read_api::get_lane_stats),
+        )
         .route("/api/matches", get(read_api::list_matches))
         .route("/api/sessions", get(read_api::list_sessions))
         .route("/api/events/matches", get(read_api::list_processed_events))
@@ -42,6 +46,10 @@ pub(super) fn router(state: AppState) -> Router {
         .route(
             "/api/matches/{identifier}/deaths",
             get(read_api::get_deaths),
+        )
+        .route(
+            "/api/matches/{identifier}/lane-stats",
+            get(read_api::get_lane_stats),
         )
         .route("/players/{account_id}", get(read_api::get_player))
         .route("/api/players/{account_id}", get(read_api::get_player))
