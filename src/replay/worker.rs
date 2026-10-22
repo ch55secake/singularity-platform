@@ -1,4 +1,5 @@
 use std::{
+    collections::HashSet,
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -7,10 +8,78 @@ use reqwest::Client;
 use tokio::fs;
 
 use super::{
-    ClickHouseClient, MODEL_VERSION, PARSER_VERSION, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS,
-    ReplayConfig, ReplayJob, ReplayMatchRow, ReplayRecord, ReplayState, ReplayStatus,
-    download_replay, parse_replay,
+    clickhouse::{ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS, ReplayMatchRow},
+    config::ReplayConfig,
+    download::download_replay,
+    parser::{MODEL_VERSION, PARSER_VERSION, parse_replay},
+    record::{ReplayRecord, job_id},
+    state::{ReplayJob, ReplayState, ReplayStatus},
 };
+
+pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    let config = ReplayConfig::from_env()?;
+    if let Some(parent) = config
+        .state_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        fs::create_dir_all(parent).await?;
+    }
+    fs::create_dir_all(&config.output_dir).await?;
+
+    let state_path = config.state_path.clone();
+    let mut state = ReplayState::load(&state_path).await?;
+    let client = Client::builder()
+        .timeout(config.timeout)
+        .user_agent("singularity-platform-replay-worker/0.1")
+        .build()?;
+    let clickhouse = ClickHouseClient::from_env(&config.timeout)?;
+    let spool = match fs::read_to_string(&config.spool_path).await {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
+        Err(error) => return Err(error.into()),
+    };
+
+    let mut summary = WorkerSummary::default();
+    let mut job_ids = HashSet::new();
+    for line in spool.lines() {
+        let Ok(record) = serde_json::from_str::<ReplayRecord>(line) else {
+            continue;
+        };
+        if !record.is_downloadable() {
+            continue;
+        }
+        let job_id = job_id(&record);
+        if !job_ids.insert(job_id.clone()) {
+            continue;
+        }
+        summary.discovered += 1;
+        process_record(
+            &mut state,
+            &client,
+            &clickhouse,
+            &config,
+            &job_id,
+            &record,
+            &mut summary,
+        )
+        .await?;
+    }
+
+    state.save().await?;
+    let disk_bytes = disk_usage(&config.output_dir).await?;
+    println!(
+        "replay worker: discovered={} downloaded={} parsed={} deferred={} failed={} disk_bytes={} disk_limit_bytes={}",
+        summary.discovered,
+        summary.downloaded,
+        summary.parsed,
+        summary.deferred,
+        summary.failed,
+        disk_bytes,
+        config.max_disk_bytes,
+    );
+    Ok(())
+}
 
 #[derive(Default)]
 pub(super) struct WorkerSummary {
