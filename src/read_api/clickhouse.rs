@@ -54,17 +54,24 @@ impl ClickHouseClient {
             warn!(status = %response.status(), "read API ClickHouse request returned an error");
             return Err(());
         }
-        let body = response.bytes().await.map_err(|error| {
-            warn!(%error, "read API ClickHouse response could not be read");
-        })?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            warn!(
-                bytes = body.len(),
-                "read API ClickHouse response exceeded the limit"
-            );
+        if let Some(bytes) = response
+            .content_length()
+            .filter(|&bytes| bytes > MAX_RESPONSE_BYTES as u64)
+        {
+            warn!(bytes, "read API ClickHouse response exceeded the limit");
             return Err(());
         }
-        let body = String::from_utf8(body.to_vec()).map_err(|_| ())?;
+        let mut response = response;
+        let mut body = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(|error| {
+            warn!(%error, "read API ClickHouse response could not be read");
+        })? {
+            if let Err(bytes) = append_bounded_chunk(&mut body, &chunk, MAX_RESPONSE_BYTES) {
+                warn!(bytes, "read API ClickHouse response exceeded the limit");
+                return Err(());
+            }
+        }
+        let body = String::from_utf8(body).map_err(|_| ())?;
         body.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
@@ -75,5 +82,28 @@ impl ClickHouseClient {
                     })
             })
             .collect()
+    }
+}
+
+fn append_bounded_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<(), usize> {
+    let bytes = body.len().saturating_add(chunk.len());
+    if bytes > max_bytes {
+        return Err(bytes);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_bounded_chunk;
+
+    #[test]
+    fn response_body_limit_rejects_before_appending_overflow() {
+        let mut body = Vec::new();
+
+        assert_eq!(append_bounded_chunk(&mut body, b"123", 3), Ok(()));
+        assert_eq!(append_bounded_chunk(&mut body, b"4", 3), Err(4));
+        assert_eq!(&body, b"123");
     }
 }
