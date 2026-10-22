@@ -12,7 +12,7 @@ use crate::{AppState, ErrorBody};
 
 use super::{
     EventQuery, Hero, ListQuery, Member, ReadApiState, api_error, authorize, mode_name,
-    non_empty_string, number_i32, number_u32, number_u64, optional_u32,
+    non_empty_string, number_i32, number_u32, number_u64, optional_u32, read_backend_error,
 };
 
 #[derive(Debug, Serialize, Clone)]
@@ -85,7 +85,7 @@ pub(crate) async fn list_matches(
         .read_api
         .query(&sql)
         .await
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "read backend unavailable"))?;
+        .map_err(read_backend_error)?;
     Ok(Json(group_core_rows(rows, &state.read_api.members)))
 }
 
@@ -109,7 +109,7 @@ pub(crate) async fn list_processed_events(
         .read_api
         .query(&sql)
         .await
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "read backend unavailable"))?;
+        .map_err(read_backend_error)?;
     Ok(Json(
         rows.into_iter()
             .filter_map(|row| {
@@ -155,10 +155,7 @@ pub(super) async fn load_core(
         "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, m.average_badge_team0, m.average_badge_team1, p.account_id, p.player_slot, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m FINAL LEFT JOIN {db}.match_players AS p FINAL ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h FINAL ON h.id = p.hero_id WHERE {selector} ORDER BY p.player_slot",
         db = state.database,
     );
-    let rows = state
-        .query(&sql)
-        .await
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "read backend unavailable"))?;
+    let rows = state.query(&sql).await.map_err(read_backend_error)?;
     Ok(group_core(rows))
 }
 

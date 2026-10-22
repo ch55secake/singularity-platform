@@ -18,7 +18,7 @@ mod matches;
 pub(crate) mod players;
 mod sessions;
 
-use clickhouse::ClickHouseClient;
+use clickhouse::{ClickHouseClient, ClickHouseError};
 use impact::{
     IMPACT_SCORE_VERSION, ImpactMetrics, ImpactScore, calculate_impact_scores, round_score,
 };
@@ -95,7 +95,7 @@ impl ReadApiState {
         })
     }
 
-    async fn query(&self, sql: &str) -> Result<Vec<Value>, ()> {
+    async fn query(&self, sql: &str) -> Result<Vec<Value>, ClickHouseError> {
         self.clickhouse.query(sql).await
     }
 }
@@ -178,6 +178,20 @@ fn api_error(status: StatusCode, error: &'static str) -> (StatusCode, Json<Error
     (status, Json(ErrorBody { error }))
 }
 
+fn read_backend_error(error: ClickHouseError) -> (StatusCode, Json<ErrorBody>) {
+    match error {
+        ClickHouseError::Unavailable => {
+            api_error(StatusCode::SERVICE_UNAVAILABLE, "read backend unavailable")
+        }
+        ClickHouseError::QueryRejected => {
+            api_error(StatusCode::INTERNAL_SERVER_ERROR, "read query failed")
+        }
+        ClickHouseError::InvalidResponse => {
+            api_error(StatusCode::BAD_GATEWAY, "invalid read backend response")
+        }
+    }
+}
+
 fn mode_name(player_count: usize) -> String {
     if player_count > 0 && player_count.is_multiple_of(2) {
         format!("{}v{}", player_count / 2, player_count / 2)
@@ -248,10 +262,7 @@ async fn query_rows(
     state: &ReadApiState,
     sql: &str,
 ) -> Result<Vec<Value>, (StatusCode, Json<ErrorBody>)> {
-    state
-        .query(sql)
-        .await
-        .map_err(|_| api_error(StatusCode::SERVICE_UNAVAILABLE, "read backend unavailable"))
+    state.query(sql).await.map_err(read_backend_error)
 }
 
 #[cfg(test)]
@@ -267,5 +278,21 @@ mod tests {
         assert_eq!(row["start_time"], 1);
         assert_eq!(row["team"], 1);
         assert_eq!(row["p.team"], 0);
+    }
+
+    #[test]
+    fn distinguishes_clickhouse_query_rejection_from_unavailability() {
+        assert_eq!(
+            read_backend_error(ClickHouseError::QueryRejected).0,
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
+        assert_eq!(
+            read_backend_error(ClickHouseError::Unavailable).0,
+            StatusCode::SERVICE_UNAVAILABLE
+        );
+        assert_eq!(
+            read_backend_error(ClickHouseError::InvalidResponse).0,
+            StatusCode::BAD_GATEWAY
+        );
     }
 }

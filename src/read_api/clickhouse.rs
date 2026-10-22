@@ -8,6 +8,13 @@ use super::unqualify_columns;
 
 const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum ClickHouseError {
+    Unavailable,
+    QueryRejected,
+    InvalidResponse,
+}
+
 #[derive(Clone)]
 pub(super) struct ClickHouseClient {
     client: Client,
@@ -31,9 +38,9 @@ impl ClickHouseClient {
         })
     }
 
-    pub(super) async fn query(&self, sql: &str) -> Result<Vec<Value>, ()> {
+    pub(super) async fn query(&self, sql: &str) -> Result<Vec<Value>, ClickHouseError> {
         let Some(url) = &self.url else {
-            return Err(());
+            return Err(ClickHouseError::Unavailable);
         };
         let mut request = self
             .client
@@ -49,29 +56,34 @@ impl ClickHouseClient {
         }
         let response = request.send().await.map_err(|error| {
             warn!(%error, "read API ClickHouse request failed");
+            ClickHouseError::Unavailable
         })?;
         if !response.status().is_success() {
             warn!(status = %response.status(), "read API ClickHouse request returned an error");
-            return Err(());
+            return Err(ClickHouseError::QueryRejected);
         }
         if let Some(bytes) = response
             .content_length()
             .filter(|&bytes| bytes > MAX_RESPONSE_BYTES as u64)
         {
             warn!(bytes, "read API ClickHouse response exceeded the limit");
-            return Err(());
+            return Err(ClickHouseError::InvalidResponse);
         }
         let mut response = response;
         let mut body = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|error| {
             warn!(%error, "read API ClickHouse response could not be read");
+            ClickHouseError::Unavailable
         })? {
             if let Err(bytes) = append_bounded_chunk(&mut body, &chunk, MAX_RESPONSE_BYTES) {
                 warn!(bytes, "read API ClickHouse response exceeded the limit");
-                return Err(());
+                return Err(ClickHouseError::InvalidResponse);
             }
         }
-        let body = String::from_utf8(body).map_err(|_| ())?;
+        let body = String::from_utf8(body).map_err(|error| {
+            warn!(%error, "read API ClickHouse response was not UTF-8");
+            ClickHouseError::InvalidResponse
+        })?;
         body.lines()
             .filter(|line| !line.trim().is_empty())
             .map(|line| {
@@ -79,6 +91,7 @@ impl ClickHouseClient {
                     .map(unqualify_columns)
                     .map_err(|error| {
                         warn!(%error, "read API ClickHouse row was invalid JSON");
+                        ClickHouseError::InvalidResponse
                     })
             })
             .collect()
