@@ -32,8 +32,6 @@ jobs:
     steps:
       - name: Checkout
         uses: actions/checkout@v7
-      - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -50,7 +48,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          version: "21.12"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
@@ -67,7 +68,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          version: "21.12"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
@@ -82,7 +86,10 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v7
       - name: Install Protobuf compiler
-        run: sudo apt-get update && sudo apt-get install --yes protobuf-compiler
+        uses: arduino/setup-protoc@c65c819552d16ad3c9b72d9dfd5ba5237b9c906b # v3
+        with:
+          version: "21.12"
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
       - name: Cache Rust dependencies
