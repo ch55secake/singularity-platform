@@ -4,13 +4,12 @@ use axum::{
     Json,
     http::{HeaderMap, StatusCode},
 };
-use reqwest::Client;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tracing::warn;
 
 use crate::{ErrorBody, auth::bearer_token, constant_time_eq, server_config::non_empty_env};
 
+mod clickhouse;
 mod impact;
 mod match_context;
 mod match_detail;
@@ -18,6 +17,7 @@ mod matches;
 pub(crate) mod players;
 mod sessions;
 
+use clickhouse::ClickHouseClient;
 use impact::{
     IMPACT_SCORE_VERSION, ImpactMetrics, ImpactScore, calculate_impact_scores, round_score,
 };
@@ -33,15 +33,11 @@ const DEFAULT_TIMEOUT_SECONDS: u64 = 10;
 const DEFAULT_LIMIT: u32 = 50;
 const MAX_LIMIT: u32 = 100;
 const MAX_OFFSET: u32 = 10_000;
-const MAX_RESPONSE_BYTES: usize = 32 * 1024 * 1024;
 
 #[derive(Clone)]
 pub(crate) struct ReadApiState {
-    client: Client,
-    url: Option<String>,
+    clickhouse: ClickHouseClient,
     database: String,
-    user: Option<String>,
-    password: Option<String>,
     token: Option<String>,
     members: HashMap<u32, String>,
 }
@@ -87,67 +83,18 @@ impl ReadApiState {
             ));
         }
         let members = read_members()?;
-        let client = Client::builder()
-            .timeout(Duration::from_secs(timeout))
-            .user_agent("singularity-platform-read-api/0.1")
-            .build()
-            .map_err(std::io::Error::other)?;
+        let clickhouse = ClickHouseClient::new(Duration::from_secs(timeout))?;
         Ok(Self {
-            client,
-            url: non_empty_env("SINGULARITY_CLICKHOUSE_URL"),
+            clickhouse,
             database: env::var("SINGULARITY_CLICKHOUSE_DATABASE")
                 .unwrap_or_else(|_| DEFAULT_DATABASE.to_string()),
-            user: non_empty_env("SINGULARITY_CLICKHOUSE_USER"),
-            password: non_empty_env("SINGULARITY_CLICKHOUSE_PASSWORD"),
             token: non_empty_env("SINGULARITY_READ_TOKEN"),
             members,
         })
     }
 
     async fn query(&self, sql: &str) -> Result<Vec<Value>, ()> {
-        let Some(url) = &self.url else {
-            return Err(());
-        };
-        let mut request = self
-            .client
-            .post(url)
-            // Return UInt64/Int64 as JSON numbers, not quoted strings.
-            .query(&[("output_format_json_quote_64bit_integers", "0")])
-            // The SQL goes in the body: ClickHouse rejects a POST without a
-            // body (411 Length Required), and long queries stay out of the URL.
-            .header("content-type", "text/plain")
-            .body(format!("{sql} FORMAT JSONEachRow"));
-        if let Some(user) = &self.user {
-            request = request.basic_auth(user, self.password.as_deref());
-        }
-        let response = request.send().await.map_err(|error| {
-            warn!(%error, "read API ClickHouse request failed");
-        })?;
-        if !response.status().is_success() {
-            warn!(status = %response.status(), "read API ClickHouse request returned an error");
-            return Err(());
-        }
-        let body = response.bytes().await.map_err(|error| {
-            warn!(%error, "read API ClickHouse response could not be read");
-        })?;
-        if body.len() > MAX_RESPONSE_BYTES {
-            warn!(
-                bytes = body.len(),
-                "read API ClickHouse response exceeded the limit"
-            );
-            return Err(());
-        }
-        let body = String::from_utf8(body.to_vec()).map_err(|_| ())?;
-        body.lines()
-            .filter(|line| !line.trim().is_empty())
-            .map(|line| {
-                serde_json::from_str(line)
-                    .map(unqualify_columns)
-                    .map_err(|error| {
-                        warn!(%error, "read API ClickHouse row was invalid JSON");
-                    })
-            })
-            .collect()
+        self.clickhouse.query(sql).await
     }
 }
 

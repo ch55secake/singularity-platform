@@ -1,11 +1,3 @@
-use std::{
-    collections::HashSet,
-    time::{SystemTime, UNIX_EPOCH},
-};
-
-use reqwest::Client;
-use tokio::fs;
-
 mod clickhouse;
 mod config;
 mod download;
@@ -14,79 +6,26 @@ mod record;
 mod state;
 mod worker;
 
-use clickhouse::{ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS, ReplayMatchRow};
-use config::ReplayConfig;
-use download::download_replay;
 #[cfg(test)]
-use download::{decompress_file, decompress_replay, replay_url};
-use parser::{MODEL_VERSION, PARSER_VERSION, parse_replay};
-use record::{ReplayRecord, job_id};
-use state::{ReplayJob, ReplayState, ReplayStatus};
-use worker::{WorkerSummary, disk_usage, process_record};
+use clickhouse::ClickHouseClient;
+use config::ReplayConfig;
+#[cfg(test)]
+use download::{decompress_file, decompress_replay, download_replay, replay_url};
+#[cfg(test)]
+use parser::{MODEL_VERSION, parse_replay};
+use record::ReplayRecord;
+#[cfg(test)]
+use record::job_id;
+#[cfg(test)]
+use reqwest::Client;
+#[cfg(test)]
+use state::{ReplayState, ReplayStatus};
+use std::time::{SystemTime, UNIX_EPOCH};
+#[cfg(test)]
+use worker::{WorkerSummary, process_record};
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let config = ReplayConfig::from_env()?;
-    if let Some(parent) = config
-        .state_path
-        .parent()
-        .filter(|parent| !parent.as_os_str().is_empty())
-    {
-        fs::create_dir_all(parent).await?;
-    }
-    fs::create_dir_all(&config.output_dir).await?;
-
-    let state_path = config.state_path.clone();
-    let mut state = ReplayState::load(&state_path).await?;
-    let client = Client::builder()
-        .timeout(config.timeout)
-        .user_agent("singularity-platform-replay-worker/0.1")
-        .build()?;
-    let clickhouse = ClickHouseClient::from_env(&config.timeout)?;
-    let spool = match fs::read_to_string(&config.spool_path).await {
-        Ok(contents) => contents,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => String::new(),
-        Err(error) => return Err(error.into()),
-    };
-
-    let mut summary = WorkerSummary::default();
-    let mut job_ids = HashSet::new();
-    for line in spool.lines() {
-        let Ok(record) = serde_json::from_str::<ReplayRecord>(line) else {
-            continue;
-        };
-        if !record.is_downloadable() {
-            continue;
-        }
-        let job_id = job_id(&record);
-        if !job_ids.insert(job_id.clone()) {
-            continue;
-        }
-        summary.discovered += 1;
-        process_record(
-            &mut state,
-            &client,
-            &clickhouse,
-            &config,
-            &job_id,
-            &record,
-            &mut summary,
-        )
-        .await?;
-    }
-
-    state.save().await?;
-    let disk_bytes = disk_usage(&config.output_dir).await?;
-    println!(
-        "replay worker: discovered={} downloaded={} parsed={} deferred={} failed={} disk_bytes={} disk_limit_bytes={}",
-        summary.discovered,
-        summary.downloaded,
-        summary.parsed,
-        summary.deferred,
-        summary.failed,
-        disk_bytes,
-        config.max_disk_bytes,
-    );
-    Ok(())
+    worker::run().await
 }
 
 fn now_nanos() -> u128 {
