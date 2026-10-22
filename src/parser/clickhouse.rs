@@ -5,6 +5,9 @@ use serde::Serialize;
 
 use super::{DEFAULT_CLICKHOUSE_DATABASE, DEFAULT_TIMEOUT_SECONDS};
 
+// A duplicate check returns one decimal UInt64 plus a newline.
+const MAX_DUPLICATE_CHECK_RESPONSE_BYTES: usize = 64;
+
 struct ClickHouseConfig {
     url: String,
     database: String,
@@ -108,7 +111,52 @@ impl ClickHouseClient {
         if !response.status().is_success() {
             return Err(std::io::Error::other("ClickHouse duplicate check failed").into());
         }
-        let count = response.text().await?.trim().parse::<u64>()?;
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_DUPLICATE_CHECK_RESPONSE_BYTES as u64)
+        {
+            return Err(
+                std::io::Error::other("ClickHouse duplicate check response is too large").into(),
+            );
+        }
+        let mut response = response;
+        let mut body = Vec::with_capacity(MAX_DUPLICATE_CHECK_RESPONSE_BYTES);
+        while let Some(chunk) = response.chunk().await? {
+            if append_bounded_chunk(&mut body, &chunk).is_err() {
+                return Err(std::io::Error::other(
+                    "ClickHouse duplicate check response is too large",
+                )
+                .into());
+            }
+        }
+        let count = std::str::from_utf8(&body)?.trim().parse::<u64>()?;
         Ok(count > 0)
+    }
+}
+
+fn append_bounded_chunk(body: &mut Vec<u8>, chunk: &[u8]) -> Result<(), usize> {
+    let bytes = body.len().saturating_add(chunk.len());
+    if bytes > MAX_DUPLICATE_CHECK_RESPONSE_BYTES {
+        return Err(bytes);
+    }
+    body.extend_from_slice(chunk);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{MAX_DUPLICATE_CHECK_RESPONSE_BYTES, append_bounded_chunk};
+
+    #[test]
+    fn duplicate_check_response_limit_rejects_overflow_before_appending() {
+        let mut body = Vec::new();
+        let exact_limit = vec![b'0'; MAX_DUPLICATE_CHECK_RESPONSE_BYTES];
+
+        assert_eq!(append_bounded_chunk(&mut body, &exact_limit), Ok(()));
+        assert_eq!(
+            append_bounded_chunk(&mut body, b"1"),
+            Err(MAX_DUPLICATE_CHECK_RESPONSE_BYTES + 1)
+        );
+        assert_eq!(body.len(), MAX_DUPLICATE_CHECK_RESPONSE_BYTES);
     }
 }
