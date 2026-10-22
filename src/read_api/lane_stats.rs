@@ -99,7 +99,7 @@ fn lane_player(player: &CorePlayer, row: Option<&Value>) -> LanePlayer {
         slot: player.slot,
         team: player.team,
         hero: player.hero.clone(),
-        snapshot_time_s: row.and_then(|row| number_u32(row, "snapshot_time_s")),
+        snapshot_time_s: row.and_then(|row| number_u32(row, "latest_snapshot_time_s")),
         kills: metric(row, "kills"),
         deaths: metric(row, "deaths"),
         assists: metric(row, "assists"),
@@ -128,16 +128,40 @@ async fn load_lane_snapshots(
     state: &ReadApiState,
     match_id: u64,
 ) -> Result<HashMap<u32, Value>, (StatusCode, Json<ErrorBody>)> {
-    let sql = format!(
-        "SELECT player_slot, max(snapshot_time_s) AS snapshot_time_s, argMax(net_worth, snapshot_time_s) AS net_worth, argMax(kills, snapshot_time_s) AS kills, argMax(deaths, snapshot_time_s) AS deaths, argMax(assists, snapshot_time_s) AS assists, argMax(creep_kills, snapshot_time_s) AS creep_kills, argMax(neutral_kills, snapshot_time_s) AS neutral_kills, argMax(denies, snapshot_time_s) AS denies, argMax(player_damage, snapshot_time_s) AS hero_damage, argMax(gold_player, snapshot_time_s) AS player_souls, argMax(gold_player_orbs, snapshot_time_s) AS player_orb_souls, argMax(gold_lane_creep, snapshot_time_s) AS lane_creep_souls, argMax(gold_lane_creep_orbs, snapshot_time_s) AS lane_creep_orb_souls, argMax(gold_neutral_creep, snapshot_time_s) AS neutral_creep_souls, argMax(gold_neutral_creep_orbs, snapshot_time_s) AS neutral_creep_orb_souls, argMax(gold_boss, snapshot_time_s) AS boss_souls, argMax(gold_boss_orb, snapshot_time_s) AS boss_orb_souls, argMax(gold_treasure, snapshot_time_s) AS treasure_souls, argMax(gold_denied, snapshot_time_s) AS denied_souls, argMax(gold_death_loss, snapshot_time_s) AS death_loss_souls FROM {db}.match_player_stats FINAL WHERE match_id = {match_id} AND snapshot_time_s <= {lane_end_s} GROUP BY player_slot ORDER BY player_slot",
-        db = state.database,
-        lane_end_s = LANE_PHASE_END_S,
-    );
+    let sql = lane_snapshot_query(&state.database, match_id);
     Ok(query_rows(state, &sql)
         .await?
         .into_iter()
         .filter_map(|row| Some((number_u32(&row, "player_slot")?, row)))
         .collect())
+}
+
+fn lane_snapshot_query(database: &str, match_id: u64) -> String {
+    format!(
+        "SELECT player_slot, max(snapshot_time_s) AS latest_snapshot_time_s, \
+         argMax(net_worth, snapshot_time_s) AS net_worth, \
+         argMax(kills, snapshot_time_s) AS kills, argMax(deaths, snapshot_time_s) AS deaths, \
+         argMax(assists, snapshot_time_s) AS assists, \
+         argMax(creep_kills, snapshot_time_s) AS creep_kills, \
+         argMax(neutral_kills, snapshot_time_s) AS neutral_kills, \
+         argMax(denies, snapshot_time_s) AS denies, \
+         argMax(player_damage, snapshot_time_s) AS hero_damage, \
+         argMax(gold_player, snapshot_time_s) AS player_souls, \
+         argMax(gold_player_orbs, snapshot_time_s) AS player_orb_souls, \
+         argMax(gold_lane_creep, snapshot_time_s) AS lane_creep_souls, \
+         argMax(gold_lane_creep_orbs, snapshot_time_s) AS lane_creep_orb_souls, \
+         argMax(gold_neutral_creep, snapshot_time_s) AS neutral_creep_souls, \
+         argMax(gold_neutral_creep_orbs, snapshot_time_s) AS neutral_creep_orb_souls, \
+         argMax(gold_boss, snapshot_time_s) AS boss_souls, \
+         argMax(gold_boss_orb, snapshot_time_s) AS boss_orb_souls, \
+         argMax(gold_treasure, snapshot_time_s) AS treasure_souls, \
+         argMax(gold_denied, snapshot_time_s) AS denied_souls, \
+         argMax(gold_death_loss, snapshot_time_s) AS death_loss_souls \
+         FROM {database}.match_player_stats FINAL \
+         WHERE match_id = {match_id} AND snapshot_time_s <= {lane_end_s} \
+         GROUP BY player_slot ORDER BY player_slot",
+        lane_end_s = LANE_PHASE_END_S,
+    )
 }
 
 async fn load_lane_deaths(
@@ -187,7 +211,7 @@ mod tests {
             assists: 0,
         };
         let row = json!({
-            "snapshot_time_s": 540,
+            "latest_snapshot_time_s": 540,
             "kills": 2,
             "deaths": 1,
             "assists": null,
@@ -234,5 +258,14 @@ mod tests {
     #[test]
     fn lane_phase_window_is_first_ten_minutes_inclusive() {
         assert_eq!(LANE_PHASE_END_S, 10 * 60);
+    }
+
+    #[test]
+    fn lane_snapshot_query_does_not_alias_the_argmax_weight_column() {
+        let sql = lane_snapshot_query("singularity", 42);
+
+        assert!(sql.contains("max(snapshot_time_s) AS latest_snapshot_time_s"));
+        assert!(sql.contains("argMax(net_worth, snapshot_time_s)"));
+        assert!(!sql.contains("AS snapshot_time_s"));
     }
 }
