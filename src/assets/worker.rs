@@ -101,10 +101,36 @@ async fn fetch_json(
     {
         return Err(std::io::Error::other("asset response is too large").into());
     }
-    let bytes = response.bytes().await?;
-    if bytes.len() as u64 > MAX_ASSET_RESPONSE_BYTES {
-        return Err(std::io::Error::other("asset response is too large").into());
+    let mut response = response;
+    let mut bytes = Vec::new();
+    while let Some(chunk) = response.chunk().await? {
+        if append_bounded_chunk(&mut bytes, &chunk, MAX_ASSET_RESPONSE_BYTES).is_err() {
+            return Err(std::io::Error::other("asset response is too large").into());
+        }
     }
     let version = snapshot_version(&bytes);
     Ok((serde_json::from_slice(&bytes)?, version))
+}
+
+fn append_bounded_chunk(bytes: &mut Vec<u8>, chunk: &[u8], max_bytes: u64) -> Result<(), u64> {
+    let received_bytes = (bytes.len() as u64).saturating_add(chunk.len() as u64);
+    if received_bytes > max_bytes {
+        return Err(received_bytes);
+    }
+    bytes.extend_from_slice(chunk);
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::append_bounded_chunk;
+
+    #[test]
+    fn asset_response_limit_rejects_overflow_before_appending() {
+        let mut bytes = Vec::new();
+
+        assert_eq!(append_bounded_chunk(&mut bytes, b"123", 3), Ok(()));
+        assert_eq!(append_bounded_chunk(&mut bytes, b"4", 3), Err(4));
+        assert_eq!(&bytes, b"123");
+    }
 }
