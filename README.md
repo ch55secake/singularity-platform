@@ -93,6 +93,7 @@ The read API is available after applying the match and asset schemas:
 curl http://127.0.0.1:8080/api/matches
 curl http://127.0.0.1:8080/api/matches/<uuid>
 curl http://127.0.0.1:8080/api/matches/<uuid>/lane-stats
+curl http://127.0.0.1:8080/api/lane-pairings
 curl http://127.0.0.1:8080/api/players/by-name/<member-name>
 ```
 
@@ -102,6 +103,13 @@ deaths recorded during that window. `souls.net_worth` is held net worth;
 `souls.lane_creeps` and the other source fields are the corresponding
 match-stat soul-source totals, not a calculation of unspent souls. Missing
 snapshot values remain `null`.
+
+The lane-pairings endpoint compares tracked-member duos assigned to the same
+lane. It reports whole-match win rate and, when both teams have a complete pair
+and 10-minute net-worth snapshots for that assigned lane, the duo's lane lead,
+tie, or trail rate and average held-net-worth difference. It returns display
+names only; account IDs are never exposed. Missing lane comparisons do not count
+as losses or zero-soul leads.
 
 Set `SINGULARITY_READ_TOKEN` to protect reads with a separate bearer token.
 Use `SINGULARITY_MEMBER_NAMES_JSON` to resolve consenting friends' account IDs

@@ -23,6 +23,7 @@ pub(super) fn router(state: AppState) -> Router {
         // carries Steam account IDs for the Discord bot.
         .route("/live", get(live::list))
         .route("/matches", get(read_api::list_matches))
+        .route("/lane-pairings", get(read_api::get_lane_pairings))
         .route("/sessions", get(read_api::list_sessions))
         .route("/events/matches", get(read_api::list_processed_events))
         .route("/matches/{identifier}", get(read_api::get_match))
@@ -36,6 +37,7 @@ pub(super) fn router(state: AppState) -> Router {
             get(read_api::get_lane_stats),
         )
         .route("/api/matches", get(read_api::list_matches))
+        .route("/api/lane-pairings", get(read_api::get_lane_pairings))
         .route("/api/sessions", get(read_api::list_sessions))
         .route("/api/events/matches", get(read_api::list_processed_events))
         .route("/api/matches/{identifier}", get(read_api::get_match))
