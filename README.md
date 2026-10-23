@@ -107,9 +107,11 @@ snapshot values remain `null`.
 The lane-pairings endpoint compares tracked-member duos assigned to the same
 lane. It reports whole-match win rate and, when both teams have a complete pair
 and 10-minute net-worth snapshots for that assigned lane, the duo's lane lead,
-tie, or trail rate and average held-net-worth difference. It returns display
-names only; account IDs are never exposed. Missing lane comparisons do not count
-as losses or zero-soul leads.
+tie, or trail rate and average held-net-worth difference. It also reports
+10-minute K/D/A, creep kills, denies, hero damage, hero-combination aggregates,
+and up to 100 recent match details per duo. It returns display names only;
+account IDs are never exposed. Missing lane comparisons do not count as losses
+or zero-soul leads.
 
 Set `SINGULARITY_READ_TOKEN` to protect reads with a separate bearer token.
 Use `SINGULARITY_MEMBER_NAMES_JSON` to resolve consenting friends' account IDs
