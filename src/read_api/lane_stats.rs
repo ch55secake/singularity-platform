@@ -16,7 +16,7 @@ use super::{
     query_rows,
 };
 
-const LANE_PHASE_END_S: u32 = 600;
+pub(super) const LANE_PHASE_END_S: u32 = 600;
 
 #[derive(Debug, Serialize)]
 pub(crate) struct LaneStats {
