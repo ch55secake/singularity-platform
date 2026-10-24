@@ -65,8 +65,10 @@ The match detail response includes the final player-stat snapshot, every stats
 timeline row, source-normalized damage, item/ability events, death events,
 world-coordinate paths, time-stamped objective and mid-boss events with map
 positions when available, current map objective positions, and the current map
-asset. Missing optional metadata is represented by nulls or empty arrays. A
-healthy service returns `503` for read requests when ClickHouse is unavailable.
+asset. Each player includes `assigned_lane` from the match data, or `null` when
+the assignment is unavailable. Missing optional metadata is represented by nulls
+or empty arrays. A healthy service returns `503` for read requests when
+ClickHouse is unavailable.
 
 Each objective event includes `t` (seconds since match start), `kind`, and
 `team` (the structure's owning team, or the claiming team for `mid_boss`). Its
