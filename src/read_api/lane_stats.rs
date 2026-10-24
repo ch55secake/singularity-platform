@@ -200,6 +200,7 @@ mod tests {
             account_id: 7,
             slot: 3,
             team: 0,
+            assigned_lane: None,
             hero: Hero {
                 id: 10,
                 name: "Hero".to_string(),
@@ -238,6 +239,7 @@ mod tests {
             account_id: 7,
             slot: 3,
             team: 0,
+            assigned_lane: None,
             hero: Hero {
                 id: 10,
                 name: "Hero".to_string(),

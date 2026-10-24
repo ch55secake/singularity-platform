@@ -64,6 +64,7 @@ struct BuildEntry {
 struct Player {
     slot: u32,
     team: i32,
+    assigned_lane: Option<u32>,
     member: Option<Member>,
     hero: super::Hero,
     kills: u32,
@@ -374,6 +375,7 @@ fn build_player(
     Player {
         slot: player.slot,
         team: player.team,
+        assigned_lane: player.assigned_lane,
         member: member_for(members, player.account_id),
         hero: player.hero.clone(),
         kills: player.kills,

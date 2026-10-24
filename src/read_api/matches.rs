@@ -49,6 +49,7 @@ pub(super) struct CorePlayer {
     pub(super) account_id: u32,
     pub(super) slot: u32,
     pub(super) team: i32,
+    pub(super) assigned_lane: Option<u32>,
     pub(super) hero: Hero,
     pub(super) kills: u32,
     pub(super) deaths: u32,
@@ -152,7 +153,7 @@ pub(super) async fn load_core(
     selector: &str,
 ) -> Result<Option<CoreMatch>, (StatusCode, Json<ErrorBody>)> {
     let sql = format!(
-        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, m.average_badge_team0, m.average_badge_team1, p.account_id, p.player_slot, p.team, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m FINAL LEFT JOIN {db}.match_players AS p FINAL ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h FINAL ON h.id = p.hero_id WHERE {selector} ORDER BY p.player_slot",
+        "SELECT m.public_id AS uuid, m.match_id, m.start_time, m.duration_s, m.winning_team, m.average_badge_team0, m.average_badge_team1, p.account_id, p.player_slot, p.team, p.assigned_lane, p.hero_id, p.kills, p.deaths, p.assists, h.name AS hero_name, h.image_url AS hero_image, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_sm'), ''), nullIf(h.image_url, '')) AS hero_icon, coalesce(nullIf(JSONExtractString(h.payload_json, 'images', 'icon_hero_card'), ''), nullIf(JSONExtractString(h.payload_json, 'images', 'hero_card'), ''), nullIf(h.image_url, '')) AS hero_card FROM {db}.matches AS m FINAL LEFT JOIN {db}.match_players AS p FINAL ON p.match_id = m.match_id LEFT JOIN {db}.heroes AS h FINAL ON h.id = p.hero_id WHERE {selector} ORDER BY p.player_slot",
         db = state.database,
     );
     let rows = state.query(&sql).await.map_err(read_backend_error)?;
@@ -223,6 +224,7 @@ fn core_row(row: Value) -> Option<(CoreMatch, Option<CorePlayer>)> {
         account_id: number_u32(&row, "account_id").unwrap_or_default(),
         slot,
         team: number_i32(&row, "team").unwrap_or_default(),
+        assigned_lane: optional_u32(&row, "assigned_lane"),
         hero: Hero {
             id: number_u32(&row, "hero_id").unwrap_or_default(),
             name: non_empty_string(&row, "hero_name").unwrap_or_else(|| "Unknown".to_string()),
@@ -286,6 +288,7 @@ mod tests {
                 "player_slot": 1,
                 "account_id": 99,
                 "team": 0,
+                "assigned_lane": 2,
                 "hero_id": 72,
                 "hero_name": "Billy",
                 "kills": 3,
@@ -313,6 +316,18 @@ mod tests {
         assert_eq!(matches[0].players[0].member.as_ref().unwrap().name, "oscar");
         assert_eq!(matches[1].uuid, "old");
         assert!(matches[1].players[0].member.is_none());
+    }
+
+    #[test]
+    fn parses_assigned_lane_for_match_detail_players() {
+        let (_, player) = core_row(serde_json::json!({
+            "match_id": 7,
+            "player_slot": 1,
+            "assigned_lane": 2
+        }))
+        .unwrap();
+
+        assert_eq!(player.unwrap().assigned_lane, Some(2));
     }
 
     #[test]
