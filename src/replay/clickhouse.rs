@@ -102,7 +102,13 @@ impl ClickHouseClient {
         }
         let response = request.send().await?;
         if !response.status().is_success() {
-            return Err(std::io::Error::other("ClickHouse query failed").into());
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            let detail: String = body.chars().take(1_000).collect();
+            return Err(std::io::Error::other(format!(
+                "ClickHouse query failed ({status}): {detail}"
+            ))
+            .into());
         }
         let body = response.text().await?;
         body.lines()

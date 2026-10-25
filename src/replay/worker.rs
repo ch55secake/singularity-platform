@@ -143,16 +143,19 @@ struct ResourceReparseStatusRow {
 async fn pending_resource_reparses(
     clickhouse: &ClickHouseClient,
 ) -> Result<Vec<PendingResourceReparse>, Box<dyn std::error::Error>> {
-    let sql = format!(
-        "SELECT match_id, argMax(request_id, request_id) AS request_id, argMax(requested_at, request_id) AS requested_at FROM (SELECT match_id, request_id, argMax(requested_at, model_version) AS requested_at, argMax(status, model_version) AS status FROM {db}.replay_reparse_requests GROUP BY match_id, request_id) GROUP BY match_id HAVING argMax(status, request_id) = 'pending' ORDER BY requested_at LIMIT 100",
-        db = clickhouse.database,
-    );
+    let sql = pending_resource_reparse_query(&clickhouse.database);
     clickhouse
         .query_rows(&sql)
         .await?
         .into_iter()
         .map(|row| Ok(serde_json::from_value(row)?))
         .collect()
+}
+
+fn pending_resource_reparse_query(database: &str) -> String {
+    format!(
+        "SELECT match_id, request_id, requested_at FROM (SELECT match_id, request_id, argMax(requested_at, model_version) AS requested_at, argMax(status, model_version) AS status FROM {database}.replay_reparse_requests GROUP BY match_id, request_id) WHERE status = 'pending' ORDER BY requested_at LIMIT 100"
+    )
 }
 
 async fn update_reparse_request(
@@ -468,4 +471,19 @@ fn now_seconds() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap_or_default()
         .as_secs()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::pending_resource_reparse_query;
+
+    #[test]
+    fn pending_reparse_query_selects_latest_status_per_request() {
+        let query = pending_resource_reparse_query("my_db");
+
+        assert!(query.contains("FROM my_db.replay_reparse_requests"));
+        assert!(query.contains("argMax(status, model_version) AS status"));
+        assert!(query.contains("WHERE status = 'pending'"));
+        assert!(query.ends_with("ORDER BY requested_at LIMIT 100"));
+    }
 }
