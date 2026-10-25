@@ -8,7 +8,10 @@ use reqwest::Client;
 use tokio::fs;
 
 use super::{
-    clickhouse::{ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS, ReplayMatchRow},
+    clickhouse::{
+        ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS, REPLAY_RESOURCE_COLUMNS,
+        ReplayMatchRow,
+    },
     config::ReplayConfig,
     download::download_replay,
     parser::{MODEL_VERSION, PARSER_VERSION, parse_replay},
@@ -267,6 +270,13 @@ pub(super) async fn process_record(
             "replay_positions",
             REPLAY_POSITION_COLUMNS,
             &parsed.positions,
+        )
+        .await?;
+    clickhouse
+        .insert(
+            "replay_resources",
+            REPLAY_RESOURCE_COLUMNS,
+            &parsed.resources,
         )
         .await?;
 

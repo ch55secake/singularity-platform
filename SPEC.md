@@ -212,6 +212,14 @@ The replay worker records retry count, next retry time, and a bounded last error
 for failed downloads or parses. The server must not require a Steam account in
 any stage.
 
+Replay parsing writes player positions to `replay_positions` and presence
+transitions for neutral troopers and Sinner’s Sacrifice machines to
+`replay_resources`. Resource coordinates are the entity position when first
+observed active; a later inactive transition ends that marker. `match_detail`
+returns these events in replay-time order, and matches without replay data have
+an empty `resources` array. Sinner’s Sacrifice presence does not indicate that a
+machine is ready to be used; the replay entity data does not expose that state.
+
 ## Acceptance criteria
 
 - Valid cache submissions are accepted and persisted.

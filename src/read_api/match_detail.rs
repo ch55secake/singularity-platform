@@ -99,6 +99,7 @@ pub(crate) struct MatchDetail {
     players: Vec<Player>,
     deaths: Vec<match_context::Death>,
     objectives: Vec<match_context::ObjectiveEvent>,
+    resources: Vec<match_context::ReplayResourceEvent>,
     paths: match_context::Paths,
     map: match_context::MapData,
 }
@@ -138,6 +139,7 @@ pub(crate) async fn get_match(
     let damage = load_damage(&state.read_api, core.match_id).await?;
     let builds = load_builds(&state.read_api, core.match_id).await?;
     let deaths = match_context::load_deaths(&state.read_api, core.match_id).await?;
+    let resources = match_context::load_replay_resources(&state.read_api, core.match_id).await?;
     let paths = match_context::load_paths(&state.read_api, core.match_id).await?;
     let map = match_context::load_map(&state.read_api).await?;
     let objectives = match_context::load_objectives(&state.read_api, core.match_id, &map).await?;
@@ -177,6 +179,7 @@ pub(crate) async fn get_match(
         players,
         deaths,
         objectives,
+        resources,
         paths,
         map,
     }))
