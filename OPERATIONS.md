@@ -110,8 +110,8 @@ idempotent.
 
 ## Replay worker
 
-Apply `schema/004_replays.sql`, then run one restart-safe replay pass after
-metadata ingestion:
+Apply `schema/004_replays.sql` and `schema/007_replay_resources.sql`, then run
+one restart-safe replay pass after metadata ingestion:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
@@ -123,6 +123,10 @@ Valve CDN, accepts zstd payloads despite the `.dem.bz2` suffix, and parses
 player-pawn positions with the pinned Haste revision. State transitions are
 `replay_pending`, `replay_downloaded`, and `replay_parsed`; failures retain a
 bounded error code and exponential retry time without storing salts or URLs.
+`replay_resources` stores replay-timed active/inactive transitions for neutral
+troopers and Sinner’s Sacrifice machines; the match detail API exposes these
+events so map markers follow the replay clock. Older matches without parsed
+replay data return an empty resource list.
 Rows use deterministic model-version keys and ReplacingMergeTree, so a
 download or ClickHouse retry does not create a second logical match. Raw demos
 are deleted after successful parsing by default. Set

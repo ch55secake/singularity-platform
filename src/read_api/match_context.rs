@@ -47,10 +47,47 @@ pub(super) struct ObjectiveEvent {
 }
 
 #[derive(Debug, Serialize)]
+pub(super) struct ReplayResourceEvent {
+    t: f32,
+    entity_index: i32,
+    event_index: u32,
+    kind: String,
+    active: bool,
+    position: [f32; 2],
+}
+
+#[derive(Debug, Serialize)]
 pub(super) struct MapData {
     radius: f64,
     image: String,
     objective_positions: BTreeMap<String, [f64; 2]>,
+}
+
+pub(super) async fn load_replay_resources(
+    state: &ReadApiState,
+    match_id: u64,
+) -> Result<Vec<ReplayResourceEvent>, (StatusCode, Json<ErrorBody>)> {
+    let sql = format!(
+        "SELECT entity_index, event_index, argMax(tick, model_version) AS tick, argMax(time_s, model_version) AS time_s, argMax(resource_kind, model_version) AS resource_kind, argMax(active, model_version) AS active, argMax(x, model_version) AS x, argMax(y, model_version) AS y FROM {db}.replay_resources WHERE match_id = {match_id} GROUP BY entity_index, event_index ORDER BY tick, event_index",
+        db = state.database,
+    );
+    let rows = query_rows(state, &sql).await?;
+    Ok(rows
+        .into_iter()
+        .filter_map(|row| {
+            Some(ReplayResourceEvent {
+                t: number_f32(&row, "time_s")?,
+                entity_index: number_i32(&row, "entity_index")?,
+                event_index: number_u32(&row, "event_index")?,
+                kind: string_value(&row, "resource_kind")?,
+                active: number_u32(&row, "active").unwrap_or_default() != 0,
+                position: [
+                    number_f32(&row, "x").unwrap_or_default(),
+                    number_f32(&row, "y").unwrap_or_default(),
+                ],
+            })
+        })
+        .collect())
 }
 
 pub(crate) async fn get_positions(
@@ -333,5 +370,24 @@ mod tests {
         let json = serde_json::to_value(event).unwrap();
 
         assert_eq!(json["position_key"], "team1_tier1_1");
+    }
+
+    #[test]
+    fn replay_resource_events_serialize_presence_and_position() {
+        let event = ReplayResourceEvent {
+            t: 480.0,
+            entity_index: 42,
+            event_index: 3,
+            kind: "sinner".to_string(),
+            active: false,
+            position: [100.0, -200.0],
+        };
+
+        let json = serde_json::to_value(event).unwrap();
+
+        assert_eq!(json["t"], 480.0);
+        assert_eq!(json["kind"], "sinner");
+        assert_eq!(json["active"], false);
+        assert_eq!(json["position"], serde_json::json!([100.0, -200.0]));
     }
 }
