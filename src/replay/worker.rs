@@ -1,16 +1,17 @@
 use std::{
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     path::Path,
     time::{SystemTime, UNIX_EPOCH},
 };
 
 use reqwest::Client;
+use serde::{Deserialize, Serialize};
 use tokio::fs;
 
 use super::{
     clickhouse::{
-        ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS, REPLAY_RESOURCE_COLUMNS,
-        ReplayMatchRow,
+        ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS,
+        REPLAY_REPARSE_REQUEST_COLUMNS, REPLAY_RESOURCE_COLUMNS, ReplayMatchRow,
     },
     config::ReplayConfig,
     download::download_replay,
@@ -43,17 +44,52 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         Err(error) => return Err(error.into()),
     };
 
+    let records: Vec<ReplayRecord> = spool
+        .lines()
+        .filter_map(|line| serde_json::from_str::<ReplayRecord>(line).ok())
+        .filter(ReplayRecord::is_downloadable)
+        .collect();
+    let records_by_match: HashMap<u64, &ReplayRecord> = records
+        .iter()
+        .map(|record| (record.match_id, record))
+        .collect();
+
     let mut summary = WorkerSummary::default();
-    let mut job_ids = HashSet::new();
-    for line in spool.lines() {
-        let Ok(record) = serde_json::from_str::<ReplayRecord>(line) else {
+    let mut processed_job_ids = HashSet::new();
+    let requests = pending_resource_reparses(&clickhouse).await?;
+    for request in requests {
+        let Some(record) = records_by_match.get(&request.match_id).copied() else {
+            update_reparse_request(&clickhouse, &request, "unavailable", "replay_not_available")
+                .await?;
             continue;
         };
-        if !record.is_downloadable() {
-            continue;
+        let id = job_id(record);
+        if processed_job_ids.insert(id.clone()) {
+            process_record(
+                &mut state,
+                &client,
+                &clickhouse,
+                &config,
+                ReplayProcess {
+                    job_id: &id,
+                    record,
+                    force_reparse: true,
+                },
+                &mut summary,
+            )
+            .await?;
         }
-        let job_id = job_id(&record);
-        if !job_ids.insert(job_id.clone()) {
+        if state.jobs.get(&id).is_some_and(|job| {
+            job.status == ReplayStatus::Parsed
+                && job.parser_version.as_deref() == Some(PARSER_VERSION)
+        }) {
+            update_reparse_request(&clickhouse, &request, "completed", "").await?;
+        }
+    }
+
+    for record in &records {
+        let id = job_id(record);
+        if !processed_job_ids.insert(id.clone()) {
             continue;
         }
         summary.discovered += 1;
@@ -62,8 +98,11 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             &client,
             &clickhouse,
             &config,
-            &job_id,
-            &record,
+            ReplayProcess {
+                job_id: &id,
+                record,
+                force_reparse: false,
+            },
             &mut summary,
         )
         .await?;
@@ -84,6 +123,69 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+#[derive(Debug, Clone, Deserialize)]
+struct PendingResourceReparse {
+    match_id: u64,
+    request_id: u64,
+    requested_at: u64,
+}
+
+#[derive(Debug, Serialize)]
+struct ResourceReparseStatusRow {
+    match_id: u64,
+    request_id: u64,
+    requested_at: u64,
+    status: String,
+    error_code: String,
+    model_version: u64,
+}
+
+async fn pending_resource_reparses(
+    clickhouse: &ClickHouseClient,
+) -> Result<Vec<PendingResourceReparse>, Box<dyn std::error::Error>> {
+    let sql = format!(
+        "SELECT match_id, argMax(request_id, request_id) AS request_id, argMax(requested_at, request_id) AS requested_at FROM (SELECT match_id, request_id, argMax(requested_at, model_version) AS requested_at, argMax(status, model_version) AS status FROM {db}.replay_reparse_requests GROUP BY match_id, request_id) GROUP BY match_id HAVING argMax(status, request_id) = 'pending' ORDER BY requested_at LIMIT 100",
+        db = clickhouse.database,
+    );
+    clickhouse
+        .query_rows(&sql)
+        .await?
+        .into_iter()
+        .map(|row| Ok(serde_json::from_value(row)?))
+        .collect()
+}
+
+async fn update_reparse_request(
+    clickhouse: &ClickHouseClient,
+    request: &PendingResourceReparse,
+    status: &str,
+    error_code: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let row = ResourceReparseStatusRow {
+        match_id: request.match_id,
+        request_id: request.request_id,
+        requested_at: request.requested_at,
+        status: status.to_string(),
+        error_code: error_code.to_string(),
+        model_version: now_model_version().max(request.request_id.saturating_add(1)),
+    };
+    clickhouse
+        .insert(
+            "replay_reparse_requests",
+            REPLAY_REPARSE_REQUEST_COLUMNS,
+            std::slice::from_ref(&row),
+        )
+        .await
+}
+
+fn now_model_version() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_nanos()
+        .min(u64::MAX as u128) as u64
+}
+
 #[derive(Default)]
 pub(super) struct WorkerSummary {
     pub(super) discovered: usize,
@@ -93,15 +195,25 @@ pub(super) struct WorkerSummary {
     pub(super) failed: usize,
 }
 
+pub(super) struct ReplayProcess<'a> {
+    pub(super) job_id: &'a str,
+    pub(super) record: &'a ReplayRecord,
+    pub(super) force_reparse: bool,
+}
+
 pub(super) async fn process_record(
     state: &mut ReplayState,
     client: &Client,
     clickhouse: &ClickHouseClient,
     config: &ReplayConfig,
-    job_id: &str,
-    record: &ReplayRecord,
+    process: ReplayProcess<'_>,
     summary: &mut WorkerSummary,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let ReplayProcess {
+        job_id,
+        record,
+        force_reparse,
+    } = process;
     let raw_path = config.output_dir.join(format!("{job_id}.dem"));
     let now = now_seconds();
     let existing = state.jobs.get(job_id).cloned();
@@ -110,7 +222,7 @@ pub(super) async fn process_record(
         .is_some_and(|job| job.status == ReplayStatus::Parsed)
     {
         let job = existing.as_ref().expect("parsed job exists");
-        if job.parser_version.as_deref() == Some(PARSER_VERSION) {
+        if job.parser_version.as_deref() == Some(PARSER_VERSION) && !force_reparse {
             if config.debug_retention_seconds == 0
                 || job
                     .raw_retention_until
@@ -121,35 +233,22 @@ pub(super) async fn process_record(
             return Ok(());
         }
 
-        if let Some(path) = job.raw_path.as_deref() {
-            if fs::try_exists(path).await? {
-                state.jobs.insert(
-                    job_id.to_string(),
-                    ReplayJob {
-                        status: ReplayStatus::Downloaded,
-                        attempts: job.attempts,
-                        next_retry_at: None,
-                        last_error: Some("parser_version_mismatch".to_string()),
-                        raw_path: Some(path.to_string()),
-                        position_count: None,
-                        parser_version: None,
-                        raw_retention_until: None,
-                    },
-                );
-            } else {
-                record_failure(
-                    state,
-                    job_id,
-                    ReplayStatus::Pending,
-                    job.attempts,
-                    "parser_version_mismatch",
-                    None,
-                    config,
-                )
-                .await?;
-                summary.failed += 1;
-                return Ok(());
-            }
+        if let Some(path) = job.raw_path.as_deref()
+            && fs::try_exists(path).await?
+        {
+            state.jobs.insert(
+                job_id.to_string(),
+                ReplayJob {
+                    status: ReplayStatus::Downloaded,
+                    attempts: job.attempts,
+                    next_retry_at: None,
+                    last_error: Some("parser_version_mismatch".to_string()),
+                    raw_path: Some(path.to_string()),
+                    position_count: None,
+                    parser_version: None,
+                    raw_retention_until: None,
+                },
+            );
         }
     }
     if existing

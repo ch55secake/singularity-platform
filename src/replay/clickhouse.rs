@@ -3,6 +3,7 @@ use std::time::Duration;
 
 use reqwest::Client;
 use serde::Serialize;
+use serde_json::Value;
 
 pub(super) struct ClickHouseClient {
     pub(super) http: Client,
@@ -27,6 +28,8 @@ pub(super) const REPLAY_MATCH_COLUMNS: &str =
 pub(super) const REPLAY_POSITION_COLUMNS: &str =
     "match_id, entity_index, tick, time_s, x, y, z, parser_version, model_version";
 pub(super) const REPLAY_RESOURCE_COLUMNS: &str = "match_id, entity_index, event_index, tick, time_s, resource_kind, active, x, y, z, parser_version, model_version";
+pub(super) const REPLAY_REPARSE_REQUEST_COLUMNS: &str =
+    "match_id, request_id, requested_at, status, error_code, model_version";
 
 impl ClickHouseClient {
     pub(super) fn from_env(timeout: &Duration) -> Result<Self, std::io::Error> {
@@ -82,5 +85,29 @@ impl ClickHouseClient {
             return Err(std::io::Error::other("ClickHouse insert failed").into());
         }
         Ok(())
+    }
+
+    pub(super) async fn query_rows(
+        &self,
+        sql: &str,
+    ) -> Result<Vec<Value>, Box<dyn std::error::Error>> {
+        let mut request = self
+            .http
+            .post(&self.url)
+            .query(&[("output_format_json_quote_64bit_integers", "0")])
+            .header("content-type", "text/plain")
+            .body(format!("{sql} FORMAT JSONEachRow"));
+        if let Some(user) = &self.user {
+            request = request.basic_auth(user, self.password.as_deref());
+        }
+        let response = request.send().await?;
+        if !response.status().is_success() {
+            return Err(std::io::Error::other("ClickHouse query failed").into());
+        }
+        let body = response.text().await?;
+        body.lines()
+            .filter(|line| !line.trim().is_empty())
+            .map(|line| Ok(serde_json::from_str(line)?))
+            .collect()
     }
 }

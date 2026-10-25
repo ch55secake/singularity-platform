@@ -219,6 +219,9 @@ observed active; a later inactive transition ends that marker. `match_detail`
 returns these events in replay-time order, and matches without replay data have
 an empty `resources` array. Sinner’s Sacrifice presence does not indicate that a
 machine is ready to be used; the replay entity data does not expose that state.
+An authenticated resource-reparse request is persisted in
+`replay_reparse_requests`; the periodic replay worker finds the match’s original
+salt in its spool and force-parses it, with a one-hour per-match request cooldown.
 
 ## Acceptance criteria
 

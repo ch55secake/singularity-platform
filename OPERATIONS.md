@@ -110,8 +110,9 @@ idempotent.
 
 ## Replay worker
 
-Apply `schema/004_replays.sql` and `schema/007_replay_resources.sql`, then run
-one restart-safe replay pass after metadata ingestion:
+Apply `schema/004_replays.sql`, `schema/007_replay_resources.sql`, and
+`schema/008_replay_reparse_requests.sql`, then run one restart-safe replay pass
+after metadata ingestion:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
@@ -127,6 +128,10 @@ bounded error code and exponential retry time without storing salts or URLs.
 troopers and Sinner’s Sacrifice machines; the match detail API exposes these
 events so map markers follow the replay clock. Older matches without parsed
 replay data return an empty resource list.
+An authenticated `POST /api/matches/{uuid}/resources/reparse` queues a targeted
+reparse when the UI finds no resource events. The replay worker resolves the
+match’s replay salt from the existing spool and records request status in
+`replay_reparse_requests`; duplicate requests are rate-limited for one hour.
 Rows use deterministic model-version keys and ReplacingMergeTree, so a
 download or ClickHouse retry does not create a second logical match. Raw demos
 are deleted after successful parsing by default. Set

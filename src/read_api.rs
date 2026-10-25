@@ -17,6 +17,7 @@ mod match_context;
 mod match_detail;
 mod matches;
 pub(crate) mod players;
+mod resource_reparse;
 mod sessions;
 
 use clickhouse::{ClickHouseClient, ClickHouseError};
@@ -30,6 +31,7 @@ pub(crate) use match_detail::get_match;
 pub(crate) use matches::{list_matches, list_processed_events};
 use matches::{load_core, match_selector};
 pub(crate) use players::{get_player, get_player_by_name};
+pub(crate) use resource_reparse::{get_resource_reparse_status, request_resource_reparse};
 pub(crate) use sessions::list_sessions;
 
 const DEFAULT_DATABASE: &str = "singularity";
@@ -99,6 +101,10 @@ impl ReadApiState {
 
     async fn query(&self, sql: &str) -> Result<Vec<Value>, ClickHouseError> {
         self.clickhouse.query(sql).await
+    }
+
+    async fn insert<T: Serialize>(&self, sql: &str, rows: &[T]) -> Result<(), ClickHouseError> {
+        self.clickhouse.insert(sql, rows).await
     }
 }
 
