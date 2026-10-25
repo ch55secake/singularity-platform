@@ -22,7 +22,7 @@ use reqwest::Client;
 use state::{ReplayState, ReplayStatus};
 use std::time::{SystemTime, UNIX_EPOCH};
 #[cfg(test)]
-use worker::{WorkerSummary, process_record};
+use worker::{ReplayProcess, WorkerSummary, process_record};
 
 pub async fn run() -> Result<(), Box<dyn std::error::Error>> {
     worker::run().await
@@ -217,7 +217,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn persists_once_and_deletes_the_raw_demo_after_parse() {
+    async fn force_reparse_redownloads_a_deleted_demo_and_keeps_normal_retries_idempotent() {
         let replay_listener = TcpListener::bind("127.0.0.1:0")
             .await
             .expect("replay listener binds");
@@ -227,24 +227,26 @@ mod tests {
         let compressed =
             zstd::stream::encode_all(Cursor::new(&demo), 0).expect("fixture compresses");
         let replay_server = tokio::spawn(async move {
-            let (mut stream, _) = replay_listener.accept().await.expect("replay accepts");
-            let mut request = [0_u8; 1024];
-            let _ = stream
-                .read(&mut request)
-                .await
-                .expect("replay request reads");
-            let headers = format!(
-                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
-                compressed.len()
-            );
-            stream
-                .write_all(headers.as_bytes())
-                .await
-                .expect("replay headers write");
-            stream
-                .write_all(&compressed)
-                .await
-                .expect("replay body writes");
+            for _ in 0..2 {
+                let (mut stream, _) = replay_listener.accept().await.expect("replay accepts");
+                let mut request = [0_u8; 1024];
+                let _ = stream
+                    .read(&mut request)
+                    .await
+                    .expect("replay request reads");
+                let headers = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+                    compressed.len()
+                );
+                stream
+                    .write_all(headers.as_bytes())
+                    .await
+                    .expect("replay headers write");
+                stream
+                    .write_all(&compressed)
+                    .await
+                    .expect("replay body writes");
+            }
         });
 
         let clickhouse_listener = TcpListener::bind("127.0.0.1:0")
@@ -254,20 +256,22 @@ mod tests {
             .local_addr()
             .expect("ClickHouse address reads");
         let clickhouse_server = tokio::spawn(async move {
-            let (mut stream, _) = clickhouse_listener
-                .accept()
-                .await
-                .expect("ClickHouse accepts");
-            let mut request = [0_u8; 4096];
-            let count = stream
-                .read(&mut request)
-                .await
-                .expect("ClickHouse request reads");
-            assert!(String::from_utf8_lossy(&request[..count]).contains("replay_matches"));
-            stream
-                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
-                .await
-                .expect("ClickHouse response writes");
+            for _ in 0..2 {
+                let (mut stream, _) = clickhouse_listener
+                    .accept()
+                    .await
+                    .expect("ClickHouse accepts");
+                let mut request = [0_u8; 4096];
+                let count = stream
+                    .read(&mut request)
+                    .await
+                    .expect("ClickHouse request reads");
+                assert!(String::from_utf8_lossy(&request[..count]).contains("replay_matches"));
+                stream
+                    .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                    .await
+                    .expect("ClickHouse response writes");
+            }
         });
 
         let directory = std::env::temp_dir().join(format!(
@@ -305,8 +309,11 @@ mod tests {
             &client,
             &clickhouse,
             &config,
-            &id,
-            &record,
+            ReplayProcess {
+                job_id: &id,
+                record: &record,
+                force_reparse: false,
+            },
             &mut summary,
         )
         .await
@@ -316,14 +323,35 @@ mod tests {
         assert_eq!(state.jobs[&id].status, ReplayStatus::Parsed);
         assert!(!config.output_dir.join(format!("{id}.dem")).exists());
 
+        let mut reparse_summary = WorkerSummary::default();
+        process_record(
+            &mut state,
+            &client,
+            &clickhouse,
+            &config,
+            ReplayProcess {
+                job_id: &id,
+                record: &record,
+                force_reparse: true,
+            },
+            &mut reparse_summary,
+        )
+        .await
+        .expect("forced replay reparse succeeds");
+        assert_eq!(reparse_summary.downloaded, 1);
+        assert_eq!(reparse_summary.parsed, 1);
+
         let mut retry_summary = WorkerSummary::default();
         process_record(
             &mut state,
             &client,
             &clickhouse,
             &config,
-            &id,
-            &record,
+            ReplayProcess {
+                job_id: &id,
+                record: &record,
+                force_reparse: false,
+            },
             &mut retry_summary,
         )
         .await

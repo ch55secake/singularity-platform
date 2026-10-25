@@ -67,8 +67,9 @@ SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
   singularity-platform metadata-parser
 ```
 
-After applying `schema/004_replays.sql` and `schema/007_replay_resources.sql`, run
-one replay download and parse pass with:
+After applying `schema/004_replays.sql`, `schema/007_replay_resources.sql`, and
+`schema/008_replay_reparse_requests.sql`, run one replay download and parse pass
+with:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
@@ -78,7 +79,9 @@ SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
 The worker handles replay-salt records, parses Deadlock player-pawn positions
 and neutral-camp/Sinner’s Sacrifice presence transitions with the pinned Haste
 revision, retries delayed or malformed downloads, and deletes raw demos after a
-successful parse unless a bounded debug retention window is configured.
+successful parse unless a bounded debug retention window is configured. The
+read API can queue a rate-limited replay reparse for a match when resource data
+is missing; the worker resolves the original replay salt from its spool.
 
 Refresh public name and image lookups with:
 

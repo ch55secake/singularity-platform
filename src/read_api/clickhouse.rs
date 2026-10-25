@@ -1,6 +1,7 @@
 use std::time::Duration;
 
 use reqwest::Client;
+use serde::Serialize;
 use serde_json::Value;
 use tracing::warn;
 
@@ -96,6 +97,48 @@ impl ClickHouseClient {
             })
             .collect()
     }
+
+    pub(super) async fn insert<T: Serialize>(
+        &self,
+        sql: &str,
+        rows: &[T],
+    ) -> Result<(), ClickHouseError> {
+        let Some(url) = &self.url else {
+            return Err(ClickHouseError::Unavailable);
+        };
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let mut body = Vec::new();
+        for row in rows {
+            serde_json::to_writer(&mut body, row).map_err(|error| {
+                warn!(%error, "read API ClickHouse insert row could not be serialized");
+                ClickHouseError::InvalidResponse
+            })?;
+            body.push(b'\n');
+        }
+        let mut request = self
+            .client
+            .post(url)
+            .query(&[
+                ("query", sql),
+                ("output_format_json_quote_64bit_integers", "0"),
+            ])
+            .header("content-type", "application/json")
+            .body(body);
+        if let Some(user) = &self.user {
+            request = request.basic_auth(user, self.password.as_deref());
+        }
+        let response = request.send().await.map_err(|error| {
+            warn!(%error, "read API ClickHouse insert request failed");
+            ClickHouseError::Unavailable
+        })?;
+        if !response.status().is_success() {
+            warn!(status = %response.status(), "read API ClickHouse insert was rejected");
+            return Err(ClickHouseError::QueryRejected);
+        }
+        Ok(())
+    }
 }
 
 fn append_bounded_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> Result<(), usize> {
@@ -109,7 +152,15 @@ fn append_bounded_chunk(body: &mut Vec<u8>, chunk: &[u8], max_bytes: usize) -> R
 
 #[cfg(test)]
 mod tests {
-    use super::append_bounded_chunk;
+    use std::time::Duration;
+
+    use serde::Serialize;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+    };
+
+    use super::{ClickHouseClient, append_bounded_chunk};
 
     #[test]
     fn response_body_limit_rejects_before_appending_overflow() {
@@ -118,5 +169,72 @@ mod tests {
         assert_eq!(append_bounded_chunk(&mut body, b"123", 3), Ok(()));
         assert_eq!(append_bounded_chunk(&mut body, b"4", 3), Err(4));
         assert_eq!(&body, b"123");
+    }
+
+    #[tokio::test]
+    async fn insert_sends_sql_and_json_each_row_body() {
+        #[derive(Serialize)]
+        struct Row {
+            match_id: u64,
+        }
+
+        let listener = TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("listener binds");
+        let address = listener.local_addr().expect("listener address reads");
+        let server = tokio::spawn(async move {
+            let (mut stream, _) = listener.accept().await.expect("request accepts");
+            let mut request = Vec::new();
+            let mut chunk = [0_u8; 1024];
+            loop {
+                let count = stream.read(&mut chunk).await.expect("request reads");
+                if count == 0 {
+                    break;
+                }
+                request.extend_from_slice(&chunk[..count]);
+                let Some(header_end) = request.windows(4).position(|w| w == b"\r\n\r\n") else {
+                    continue;
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let body_len = headers
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .and_then(|length| length.trim().parse::<usize>().ok())
+                    })
+                    .expect("content length exists");
+                if request.len() >= header_end + 4 + body_len {
+                    break;
+                }
+            }
+            let request = String::from_utf8_lossy(&request);
+            assert!(request.contains("replay_reparse_requests"));
+            assert!(request.contains("{\"match_id\":123}"));
+            stream
+                .write_all(b"HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n")
+                .await
+                .expect("response writes");
+        });
+
+        let client = reqwest::Client::builder()
+            .timeout(Duration::from_secs(1))
+            .build()
+            .expect("HTTP client builds");
+        let clickhouse = ClickHouseClient {
+            client,
+            url: Some(format!("http://{address}")),
+            user: None,
+            password: None,
+        };
+
+        clickhouse
+            .insert(
+                "INSERT INTO singularity.replay_reparse_requests (match_id) FORMAT JSONEachRow",
+                &[Row { match_id: 123 }],
+            )
+            .await
+            .expect("insert succeeds");
+        server.await.expect("server completes");
     }
 }
