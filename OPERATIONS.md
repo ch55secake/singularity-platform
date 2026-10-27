@@ -113,7 +113,8 @@ idempotent.
 Apply `schema/004_replays.sql`, `schema/007_replay_resources.sql`, and
 `schema/008_replay_reparse_requests.sql`, then run one restart-safe replay pass
 after metadata ingestion. Apply `schema/009_replay_detail_retention.sql` to
-expire dense map paths, damage samples, and replay overlays after 30 days:
+expire dense player paths, damage samples, and replay positions after 30 days;
+sparse resource events remain available for old match overlays:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \

@@ -224,9 +224,9 @@ An authenticated resource-reparse request is persisted in
 salt in its spool and force-parses it, with a one-hour per-match request cooldown.
 Parser-rejected raw demos are removed after three attempts to bound replay
 storage; a later forced reparse can download them again from the retained salt.
-Dense map paths, damage samples, and replay-resource transitions expire after
-30 days. Match/player summaries, stat snapshots, builds, deaths, and objectives
-remain available as long-term history.
+Dense player paths, damage samples, and replay positions expire after 30 days.
+Match/player summaries, stat snapshots, builds, deaths, objectives, and sparse
+replay-resource transitions remain available as long-term history.
 
 ## Acceptance criteria
 

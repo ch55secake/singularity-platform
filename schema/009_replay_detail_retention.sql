@@ -16,8 +16,3 @@ ALTER TABLE singularity.replay_positions
     ADD COLUMN IF NOT EXISTS retention_date Date DEFAULT today();
 ALTER TABLE singularity.replay_positions
     MODIFY TTL retention_date + INTERVAL 30 DAY DELETE;
-
-ALTER TABLE singularity.replay_resources
-    ADD COLUMN IF NOT EXISTS retention_date Date DEFAULT today();
-ALTER TABLE singularity.replay_resources
-    MODIFY TTL retention_date + INTERVAL 30 DAY DELETE;
