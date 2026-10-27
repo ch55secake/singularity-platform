@@ -112,7 +112,8 @@ idempotent.
 
 Apply `schema/004_replays.sql`, `schema/007_replay_resources.sql`, and
 `schema/008_replay_reparse_requests.sql`, then run one restart-safe replay pass
-after metadata ingestion:
+after metadata ingestion. Apply `schema/009_replay_detail_retention.sql` to
+expire dense map paths, damage samples, and replay overlays after 30 days:
 
 ```bash
 SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
@@ -122,8 +123,10 @@ SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
 The worker selects records with a `replay_salt`, downloads the replay from the
 Valve CDN, accepts zstd payloads despite the `.dem.bz2` suffix, and parses
 player-pawn positions with the pinned Haste revision. State transitions are
-`replay_pending`, `replay_downloaded`, and `replay_parsed`; failures retain a
-bounded error code and exponential retry time without storing salts or URLs.
+`replay_pending`, `replay_downloaded`, `replay_parsed`, and `replay_failed`;
+failures retain a bounded error code and exponential retry time without storing
+salts or URLs. Parser-rejected raw demos are deleted after at most three attempts;
+the salt spool remains the source for later forced reparses.
 `replay_resources` stores replay-timed active/inactive transitions for neutral
 troopers and Sinner’s Sacrifice machines; the match detail API exposes these
 events so map markers follow the replay clock. Older matches without parsed

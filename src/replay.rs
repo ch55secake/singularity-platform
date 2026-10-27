@@ -161,6 +161,10 @@ mod tests {
             serde_json::to_string(&ReplayStatus::Parsed).expect("state serializes"),
             "\"replay_parsed\""
         );
+        assert_eq!(
+            serde_json::to_string(&ReplayStatus::Failed).expect("state serializes"),
+            "\"replay_failed\""
+        );
     }
 
     #[tokio::test]
@@ -361,6 +365,76 @@ mod tests {
         clickhouse_server
             .await
             .expect("ClickHouse server completes");
+        std_fs::remove_dir_all(directory).expect("test directory removes");
+    }
+
+    #[tokio::test]
+    async fn removes_legacy_parser_failed_raw_files_before_backoff() {
+        let directory = std::env::temp_dir().join(format!(
+            "singularity-replay-failed-raw-test-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ));
+        std_fs::create_dir(&directory).expect("test directory creates");
+        let mut config = sample_config();
+        config.output_dir = directory.join("replays");
+        config.state_path = directory.join("state.json");
+        std_fs::create_dir(&config.output_dir).expect("replay directory creates");
+        let record = sample_record();
+        let id = job_id(&record);
+        let raw_path = config.output_dir.join(format!("{id}.dem"));
+        std_fs::write(&raw_path, b"raw demo retained after parse error")
+            .expect("raw replay writes");
+
+        let mut state = ReplayState {
+            path: config.state_path.clone(),
+            jobs: BTreeMap::from([(
+                id.clone(),
+                state::ReplayJob {
+                    status: ReplayStatus::Downloaded,
+                    attempts: 2,
+                    next_retry_at: Some(u64::MAX),
+                    last_error: Some("invalid_demo".to_string()),
+                    raw_path: Some(raw_path.display().to_string()),
+                    position_count: None,
+                    parser_version: None,
+                    raw_retention_until: None,
+                    parse_failures: 0,
+                },
+            )]),
+        };
+        let client = Client::builder()
+            .timeout(config.timeout)
+            .build()
+            .expect("HTTP client builds");
+        let clickhouse = ClickHouseClient {
+            http: client.clone(),
+            url: "http://127.0.0.1:1".to_string(),
+            database: "singularity".to_string(),
+            user: None,
+            password: None,
+        };
+        let mut summary = WorkerSummary::default();
+
+        process_record(
+            &mut state,
+            &client,
+            &clickhouse,
+            &config,
+            ReplayProcess {
+                job_id: &id,
+                record: &record,
+                force_reparse: false,
+            },
+            &mut summary,
+        )
+        .await
+        .expect("legacy parse failure is migrated");
+
+        assert!(!raw_path.exists());
+        assert_eq!(state.jobs[&id].status, ReplayStatus::Pending);
+        assert!(state.jobs[&id].raw_path.is_none());
+        assert_eq!(summary.deferred, 1);
         std_fs::remove_dir_all(directory).expect("test directory removes");
     }
 }
