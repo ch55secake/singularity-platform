@@ -85,9 +85,10 @@ marked failed. The read API can queue a rate-limited replay reparse for a match
 when resource data is missing; the worker resolves the original replay salt
 from its spool.
 
-`schema/009_replay_detail_retention.sql` applies 30-day TTLs to dense map paths,
-damage samples, and replay overlays. Match/player summaries, stat snapshots,
-builds, deaths, and objectives remain as long-term history.
+`schema/009_replay_detail_retention.sql` applies 30-day TTLs to dense player
+paths, damage samples, and replay positions. Match/player summaries, stat
+snapshots, builds, deaths, objectives, and sparse resource events remain as
+long-term history.
 
 Refresh public name and image lookups with:
 
