@@ -10,8 +10,8 @@ use tokio::fs;
 
 use super::{
     clickhouse::{
-        ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_POSITION_COLUMNS,
-        REPLAY_REPARSE_REQUEST_COLUMNS, REPLAY_RESOURCE_COLUMNS, ReplayMatchRow,
+        ClickHouseClient, REPLAY_MATCH_COLUMNS, REPLAY_REPARSE_REQUEST_COLUMNS,
+        REPLAY_RESOURCE_COLUMNS, ReplayMatchRow,
     },
     config::ReplayConfig,
     download::download_replay,
@@ -19,6 +19,16 @@ use super::{
     record::{ReplayRecord, job_id},
     state::{ReplayJob, ReplayState, ReplayStatus},
 };
+
+const MAX_PARSE_FAILURES: u32 = 3;
+
+fn parse_failure_status(parse_failures: u32) -> ReplayStatus {
+    if parse_failures >= MAX_PARSE_FAILURES {
+        ReplayStatus::Failed
+    } else {
+        ReplayStatus::Pending
+    }
+}
 
 pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     let config = ReplayConfig::from_env()?;
@@ -84,6 +94,18 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 && job.parser_version.as_deref() == Some(PARSER_VERSION)
         }) {
             update_reparse_request(&clickhouse, &request, "completed", "").await?;
+        } else if let Some(job) = state
+            .jobs
+            .get(&id)
+            .filter(|job| job.status == ReplayStatus::Failed)
+        {
+            update_reparse_request(
+                &clickhouse,
+                &request,
+                "failed",
+                job.last_error.as_deref().unwrap_or("parser_failed"),
+            )
+            .await?;
         }
     }
 
@@ -220,6 +242,52 @@ pub(super) async fn process_record(
     let raw_path = config.output_dir.join(format!("{job_id}.dem"));
     let now = now_seconds();
     let existing = state.jobs.get(job_id).cloned();
+    if let Some(job) = existing.as_ref()
+        && job.status == ReplayStatus::Failed
+        && job.parser_version.as_deref() == Some(PARSER_VERSION)
+        && !force_reparse
+    {
+        remove_raw_file(job.raw_path.as_deref()).await?;
+        return Ok(());
+    }
+
+    // Older state files kept parser-rejected demos indefinitely so the same
+    // deterministic failure was retried forever. The salt remains in the
+    // input spool, so discard that raw file and retry from a fresh download.
+    if let Some(job) = existing.as_ref()
+        && job.status == ReplayStatus::Downloaded
+        && job.last_error.as_deref().is_some_and(is_parse_error)
+    {
+        remove_raw_file(job.raw_path.as_deref()).await?;
+        state.jobs.insert(
+            job_id.to_string(),
+            ReplayJob {
+                status: ReplayStatus::Pending,
+                attempts: job.attempts,
+                next_retry_at: job.next_retry_at,
+                last_error: job.last_error.clone(),
+                raw_path: None,
+                position_count: None,
+                parser_version: Some(PARSER_VERSION.to_string()),
+                raw_retention_until: None,
+                parse_failures: 0,
+            },
+        );
+        state.save().await?;
+    }
+
+    let previous_parser_version = existing
+        .as_ref()
+        .and_then(|job| job.parser_version.as_deref());
+    let parse_failures = existing.as_ref().map_or(0, |job| job.parse_failures);
+    let parse_failures = if force_reparse
+        || previous_parser_version.is_some_and(|version| version != PARSER_VERSION)
+    {
+        0
+    } else {
+        parse_failures
+    };
+
     if existing
         .as_ref()
         .is_some_and(|job| job.status == ReplayStatus::Parsed)
@@ -250,6 +318,7 @@ pub(super) async fn process_record(
                     position_count: None,
                     parser_version: None,
                     raw_retention_until: None,
+                    parse_failures,
                 },
             );
         }
@@ -279,6 +348,7 @@ pub(super) async fn process_record(
                     position_count: None,
                     parser_version: None,
                     raw_retention_until: None,
+                    parse_failures,
                 },
             );
             state.save().await?;
@@ -316,6 +386,7 @@ pub(super) async fn process_record(
                         position_count: None,
                         parser_version: None,
                         raw_retention_until: None,
+                        parse_failures,
                     },
                 );
                 state.save().await?;
@@ -341,16 +412,26 @@ pub(super) async fn process_record(
     let parsed = match parse_replay(record.match_id, &raw_path, model_version) {
         Ok(parsed) => parsed,
         Err(error) => {
-            record_failure(
-                state,
-                job_id,
-                ReplayStatus::Downloaded,
-                attempt,
-                error,
-                Some(raw_path.display().to_string()),
-                config,
-            )
-            .await?;
+            let parse_failures = parse_failures.saturating_add(1);
+            let status = parse_failure_status(parse_failures);
+            let failed_permanently = status == ReplayStatus::Failed;
+            remove_raw_file(Some(&raw_path.display().to_string())).await?;
+            state.jobs.insert(
+                job_id.to_string(),
+                ReplayJob {
+                    status,
+                    attempts: attempt,
+                    next_retry_at: (!failed_permanently)
+                        .then(|| now_seconds().saturating_add(retry_delay(config, attempt))),
+                    last_error: Some(error.to_string()),
+                    raw_path: None,
+                    position_count: None,
+                    parser_version: Some(PARSER_VERSION.to_string()),
+                    raw_retention_until: None,
+                    parse_failures,
+                },
+            );
+            state.save().await?;
             summary.failed += 1;
             return Ok(());
         }
@@ -366,13 +447,6 @@ pub(super) async fn process_record(
     };
     clickhouse
         .insert("replay_matches", REPLAY_MATCH_COLUMNS, &[match_row])
-        .await?;
-    clickhouse
-        .insert(
-            "replay_positions",
-            REPLAY_POSITION_COLUMNS,
-            &parsed.positions,
-        )
         .await?;
     clickhouse
         .insert(
@@ -394,6 +468,7 @@ pub(super) async fn process_record(
             parser_version: Some(PARSER_VERSION.to_string()),
             raw_retention_until: (config.debug_retention_seconds > 0)
                 .then(|| now.saturating_add(config.debug_retention_seconds)),
+            parse_failures: 0,
         },
     );
     state.save().await?;
@@ -424,6 +499,7 @@ async fn record_failure(
     raw_path: Option<String>,
     config: &ReplayConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
+    let parse_failures = state.jobs.get(job_id).map_or(0, |job| job.parse_failures);
     state.jobs.insert(
         job_id.to_string(),
         ReplayJob {
@@ -435,10 +511,18 @@ async fn record_failure(
             position_count: None,
             parser_version: None,
             raw_retention_until: None,
+            parse_failures,
         },
     );
     state.save().await?;
     Ok(())
+}
+
+fn is_parse_error(code: &str) -> bool {
+    matches!(
+        code,
+        "parser_input_failed" | "invalid_demo" | "parser_failed" | "parser_state_failed"
+    )
 }
 
 pub(super) async fn disk_usage(path: &Path) -> Result<u64, std::io::Error> {
@@ -475,7 +559,7 @@ fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::pending_resource_reparse_query;
+    use super::{ReplayStatus, parse_failure_status, pending_resource_reparse_query};
 
     #[test]
     fn pending_reparse_query_selects_latest_status_per_request() {
@@ -485,5 +569,12 @@ mod tests {
         assert!(query.contains("argMax(status, model_version) AS status"));
         assert!(query.contains("WHERE status = 'pending'"));
         assert!(query.ends_with("ORDER BY requested_at LIMIT 100"));
+    }
+
+    #[test]
+    fn parser_failures_become_terminal_after_three_attempts() {
+        assert_eq!(parse_failure_status(1), ReplayStatus::Pending);
+        assert_eq!(parse_failure_status(2), ReplayStatus::Pending);
+        assert_eq!(parse_failure_status(3), ReplayStatus::Failed);
     }
 }

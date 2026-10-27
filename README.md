@@ -79,9 +79,15 @@ SINGULARITY_CLICKHOUSE_URL=http://127.0.0.1:8123 \
 The worker handles replay-salt records, parses Deadlock player-pawn positions
 and neutral-camp/Sinner’s Sacrifice presence transitions with the pinned Haste
 revision, retries delayed or malformed downloads, and deletes raw demos after a
-successful parse unless a bounded debug retention window is configured. The
-read API can queue a rate-limited replay reparse for a match when resource data
-is missing; the worker resolves the original replay salt from its spool.
+successful parse unless a bounded debug retention window is configured. Parser-
+rejected demos are retried three times, then deleted while the job remains
+marked failed. The read API can queue a rate-limited replay reparse for a match
+when resource data is missing; the worker resolves the original replay salt
+from its spool.
+
+`schema/009_replay_detail_retention.sql` applies 30-day TTLs to dense map paths,
+damage samples, and replay overlays. Match/player summaries, stat snapshots,
+builds, deaths, and objectives remain as long-term history.
 
 Refresh public name and image lookups with:
 

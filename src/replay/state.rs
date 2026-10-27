@@ -20,6 +20,8 @@ pub(super) enum ReplayStatus {
     Downloaded,
     #[serde(rename = "replay_parsed")]
     Parsed,
+    #[serde(rename = "replay_failed")]
+    Failed,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -34,6 +36,8 @@ pub(super) struct ReplayJob {
     pub(super) parser_version: Option<String>,
     #[serde(default)]
     pub(super) raw_retention_until: Option<u64>,
+    #[serde(default)]
+    pub(super) parse_failures: u32,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

@@ -25,8 +25,6 @@ pub(super) struct ReplayMatchRow {
 
 pub(super) const REPLAY_MATCH_COLUMNS: &str =
     "match_id, replay_job_id, parser_version, parsed_at, position_count, model_version";
-pub(super) const REPLAY_POSITION_COLUMNS: &str =
-    "match_id, entity_index, tick, time_s, x, y, z, parser_version, model_version";
 pub(super) const REPLAY_RESOURCE_COLUMNS: &str = "match_id, entity_index, event_index, tick, time_s, resource_kind, active, x, y, z, parser_version, model_version";
 pub(super) const REPLAY_REPARSE_REQUEST_COLUMNS: &str =
     "match_id, request_id, requested_at, status, error_code, model_version";
