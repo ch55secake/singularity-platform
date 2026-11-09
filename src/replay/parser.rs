@@ -15,8 +15,8 @@ use haste::{
 };
 use serde::Serialize;
 
-pub(super) const PARSER_VERSION: &str = "haste-0.0.0-player-position-resources-v2";
-pub(super) const MODEL_VERSION: u64 = 2;
+pub(super) const PARSER_VERSION: &str = "haste-0.0.0-player-position-resources-v3";
+pub(super) const MODEL_VERSION: u64 = 3;
 const POSITION_SAMPLE_TICKS: i32 = 60;
 
 const DEADLOCK_PLAYERPAWN_ENTITY: u64 = fxhash::hash_bytes(b"CCitadelPlayerPawn");
@@ -25,7 +25,6 @@ const SINNERS_SACRIFICE_ENTITY: u64 = fxhash::hash_bytes(b"CNPC_Neutral_SinnersS
 const SINNERS_SACRIFICE_HIDEOUT_ENTITY: u64 =
     fxhash::hash_bytes(b"CNPC_Neutral_SinnersSacrifice_Hideout");
 const HEALTH: u64 = fkey_from_path(&["m_iHealth"]);
-const MAX_HEALTH: u64 = fkey_from_path(&["m_iMaxHealth"]);
 const LIFE_STATE: u64 = fkey_from_path(&["m_lifeState"]);
 const CELL_X: u64 = fkey_from_path(&[
     "CBodyComponent",
@@ -243,6 +242,12 @@ fn entity_position(entity: &Entity) -> Option<[f32; 3]> {
     ])
 }
 
+fn neutral_is_alive(life_state: Option<u8>, health: Option<i64>) -> bool {
+    // Position and class identify a neutral entity. Health fields are not sent
+    // in every delta, so only explicit dead values should remove a camp marker.
+    !life_state.is_some_and(|state| state != 0) && !health.is_some_and(|health| health <= 0)
+}
+
 impl Visitor for ReplayVisitor {
     fn on_entity(
         &mut self,
@@ -309,33 +314,11 @@ impl Visitor for ReplayVisitor {
                 None,
             );
         }
-
         if is_neutral {
-            record_resource_transition(
-                &mut state,
-                entity.index(),
-                tick,
-                time_s,
-                ResourceKind::Sinner,
-                false,
-                None,
-            );
-        } else if is_sinner {
-            record_resource_transition(
-                &mut state,
-                entity.index(),
-                tick,
-                time_s,
-                ResourceKind::Neutral,
-                false,
-                None,
-            );
-        }
-        if is_neutral {
-            let Some(life_state) = entity.get_value::<u8>(&LIFE_STATE) else {
-                return Ok(());
-            };
-            if life_state != 0 {
+            if !neutral_is_alive(
+                entity.get_value::<u8>(&LIFE_STATE),
+                entity.get_value::<i64>(&HEALTH),
+            ) {
                 record_resource_transition(
                     &mut state,
                     entity.index(),
@@ -345,11 +328,6 @@ impl Visitor for ReplayVisitor {
                     false,
                     None,
                 );
-                return Ok(());
-            }
-            if entity.get_value::<i64>(&MAX_HEALTH).unwrap_or_default() <= 0
-                || entity.get_value::<i64>(&HEALTH).unwrap_or_default() <= 0
-            {
                 return Ok(());
             }
             let Some(position) = entity_position(entity) else {
@@ -368,13 +346,6 @@ impl Visitor for ReplayVisitor {
         }
 
         if is_sinner {
-            let max_health = entity.get_value::<i64>(&MAX_HEALTH).unwrap_or_default();
-            let health = entity.get_value::<i64>(&HEALTH).unwrap_or_default();
-            // These fields can disappear while a machine is inactive; a live
-            // machine bottoms out at one health, so zero is not a clear event.
-            if health <= 0 || max_health <= 0 {
-                return Ok(());
-            }
             let Some(position) = entity_position(entity) else {
                 return Ok(());
             };
@@ -459,5 +430,18 @@ mod tests {
         assert!(!state.resources[1].4);
         assert_eq!(state.resources[1].5, position);
         assert!(state.active_resources.is_empty());
+    }
+
+    #[test]
+    fn neutral_is_considered_alive_when_health_fields_are_missing() {
+        assert!(neutral_is_alive(None, None));
+        assert!(neutral_is_alive(Some(0), None));
+        assert!(neutral_is_alive(None, Some(10)));
+    }
+
+    #[test]
+    fn neutral_is_considered_inactive_only_for_explicit_dead_values() {
+        assert!(!neutral_is_alive(Some(1), Some(10)));
+        assert!(!neutral_is_alive(Some(0), Some(0)));
     }
 }

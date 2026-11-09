@@ -89,23 +89,10 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             )
             .await?;
         }
-        if state.jobs.get(&id).is_some_and(|job| {
-            job.status == ReplayStatus::Parsed
-                && job.parser_version.as_deref() == Some(PARSER_VERSION)
-        }) {
-            update_reparse_request(&clickhouse, &request, "completed", "").await?;
-        } else if let Some(job) = state
-            .jobs
-            .get(&id)
-            .filter(|job| job.status == ReplayStatus::Failed)
+        if let Some(job) = state.jobs.get(&id)
+            && let Some((status, error_code)) = terminal_reparse_status(job)
         {
-            update_reparse_request(
-                &clickhouse,
-                &request,
-                "failed",
-                job.last_error.as_deref().unwrap_or("parser_failed"),
-            )
-            .await?;
+            update_reparse_request(&clickhouse, &request, status, error_code).await?;
         }
     }
 
@@ -178,6 +165,21 @@ fn pending_resource_reparse_query(database: &str) -> String {
     format!(
         "SELECT match_id, request_id, requested_at FROM (SELECT match_id, request_id, argMax(requested_at, model_version) AS requested_at, argMax(status, model_version) AS status FROM {database}.replay_reparse_requests GROUP BY match_id, request_id) WHERE status = 'pending' ORDER BY requested_at LIMIT 100"
     )
+}
+
+fn terminal_reparse_status(job: &ReplayJob) -> Option<(&'static str, &str)> {
+    if job.status == ReplayStatus::Parsed && job.parser_version.as_deref() == Some(PARSER_VERSION) {
+        Some(("completed", ""))
+    } else if job.last_error.as_deref() == Some("http_404") {
+        Some(("unavailable", "replay_not_available"))
+    } else if job.status == ReplayStatus::Failed {
+        Some((
+            "failed",
+            job.last_error.as_deref().unwrap_or("parser_failed"),
+        ))
+    } else {
+        None
+    }
 }
 
 async fn update_reparse_request(
@@ -323,11 +325,7 @@ pub(super) async fn process_record(
             );
         }
     }
-    if existing
-        .as_ref()
-        .and_then(|job| job.next_retry_at)
-        .is_some_and(|retry_at| retry_at > now)
-    {
+    if should_defer_retry(existing.as_ref(), now, force_reparse) {
         summary.deferred += 1;
         return Ok(());
     }
@@ -550,6 +548,13 @@ fn retry_delay(config: &ReplayConfig, attempt: u32) -> u64 {
         .min(config.retry_max_seconds)
 }
 
+fn should_defer_retry(job: Option<&ReplayJob>, now: u64, force_reparse: bool) -> bool {
+    !force_reparse
+        && job
+            .and_then(|job| job.next_retry_at)
+            .is_some_and(|retry_at| retry_at > now)
+}
+
 fn now_seconds() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -559,7 +564,24 @@ fn now_seconds() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use super::{ReplayStatus, parse_failure_status, pending_resource_reparse_query};
+    use super::{
+        PARSER_VERSION, ReplayJob, ReplayStatus, parse_failure_status,
+        pending_resource_reparse_query, should_defer_retry, terminal_reparse_status,
+    };
+
+    fn pending_job(last_error: Option<&str>, next_retry_at: Option<u64>) -> ReplayJob {
+        ReplayJob {
+            status: ReplayStatus::Pending,
+            attempts: 1,
+            next_retry_at,
+            last_error: last_error.map(str::to_string),
+            raw_path: None,
+            position_count: None,
+            parser_version: None,
+            raw_retention_until: None,
+            parse_failures: 0,
+        }
+    }
 
     #[test]
     fn pending_reparse_query_selects_latest_status_per_request() {
@@ -576,5 +598,40 @@ mod tests {
         assert_eq!(parse_failure_status(1), ReplayStatus::Pending);
         assert_eq!(parse_failure_status(2), ReplayStatus::Pending);
         assert_eq!(parse_failure_status(3), ReplayStatus::Failed);
+    }
+
+    #[test]
+    fn missing_replay_is_terminal_for_reparse_requests() {
+        let job = pending_job(Some("http_404"), Some(3_600));
+
+        assert_eq!(
+            terminal_reparse_status(&job),
+            Some(("unavailable", "replay_not_available"))
+        );
+    }
+
+    #[test]
+    fn forced_reparse_does_not_wait_for_normal_retry_backoff() {
+        let job = pending_job(Some("http_5xx"), Some(3_600));
+
+        assert!(should_defer_retry(Some(&job), 1_000, false));
+        assert!(!should_defer_retry(Some(&job), 1_000, true));
+    }
+
+    #[test]
+    fn current_parser_results_complete_reparse_requests() {
+        let job = ReplayJob {
+            status: ReplayStatus::Parsed,
+            attempts: 1,
+            next_retry_at: None,
+            last_error: None,
+            raw_path: None,
+            position_count: Some(1),
+            parser_version: Some(PARSER_VERSION.to_string()),
+            raw_retention_until: None,
+            parse_failures: 0,
+        };
+
+        assert_eq!(terminal_reparse_status(&job), Some(("completed", "")));
     }
 }
