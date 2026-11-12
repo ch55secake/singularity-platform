@@ -342,6 +342,18 @@ pub(super) async fn process_record(
         }
     }
     if should_defer_retry(existing.as_ref(), now, force_reparse) {
+        if force_reparse {
+            let job = existing
+                .as_ref()
+                .expect("deferred retries have an existing job");
+            tracing::info!(
+                match_id = record.match_id,
+                attempt = job.attempts,
+                next_retry_at = job.next_retry_at,
+                error_code = job.last_error.as_deref().unwrap_or(""),
+                "replay reparse deferred by retry backoff"
+            );
+        }
         summary.deferred += 1;
         return Ok(());
     }
