@@ -71,6 +71,10 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
         let Some(record) = records_by_match.get(&request.match_id).copied() else {
             update_reparse_request(&clickhouse, &request, "unavailable", "replay_not_available")
                 .await?;
+            tracing::warn!(
+                match_id = request.match_id,
+                "replay reparse unavailable: no replay salt in spool"
+            );
             continue;
         };
         let id = job_id(record);
@@ -83,7 +87,10 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
                 ReplayProcess {
                     job_id: &id,
                     record,
-                    force_reparse: true,
+                    // Bypass an old retry backoff once. If the attempt fails,
+                    // the recorded error code makes subsequent passes respect
+                    // the normal retry schedule.
+                    force_reparse: request.error_code.is_empty(),
                 },
                 &mut summary,
             )
@@ -93,6 +100,12 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
             && let Some((status, error_code)) = terminal_reparse_status(job)
         {
             update_reparse_request(&clickhouse, &request, status, error_code).await?;
+        } else if let Some(job) = state.jobs.get(&id)
+            && job.status == ReplayStatus::Pending
+            && let Some(error_code) = job.last_error.as_deref()
+            && request.error_code != error_code
+        {
+            update_reparse_request(&clickhouse, &request, "pending", error_code).await?;
         }
     }
 
@@ -120,10 +133,11 @@ pub(super) async fn run() -> Result<(), Box<dyn std::error::Error>> {
     state.save().await?;
     let disk_bytes = disk_usage(&config.output_dir).await?;
     println!(
-        "replay worker: discovered={} downloaded={} parsed={} deferred={} failed={} disk_bytes={} disk_limit_bytes={}",
+        "replay worker: discovered={} downloaded={} parsed={} resource_events={} deferred={} failed={} disk_bytes={} disk_limit_bytes={}",
         summary.discovered,
         summary.downloaded,
         summary.parsed,
+        summary.resource_events,
         summary.deferred,
         summary.failed,
         disk_bytes,
@@ -137,6 +151,7 @@ struct PendingResourceReparse {
     match_id: u64,
     request_id: u64,
     requested_at: u64,
+    error_code: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -163,7 +178,7 @@ async fn pending_resource_reparses(
 
 fn pending_resource_reparse_query(database: &str) -> String {
     format!(
-        "SELECT match_id, request_id, requested_at FROM (SELECT match_id, request_id, argMax(requested_at, model_version) AS requested_at, argMax(status, model_version) AS status FROM {database}.replay_reparse_requests GROUP BY match_id, request_id) WHERE status = 'pending' ORDER BY requested_at LIMIT 100"
+        "SELECT match_id, request_id, requested_at, error_code FROM (SELECT match_id, request_id, argMax(requested_at, model_version) AS requested_at, argMax(status, model_version) AS status, argMax(error_code, model_version) AS error_code FROM {database}.replay_reparse_requests GROUP BY match_id, request_id) WHERE status = 'pending' ORDER BY requested_at LIMIT 100"
     )
 }
 
@@ -218,6 +233,7 @@ pub(super) struct WorkerSummary {
     pub(super) discovered: usize,
     pub(super) downloaded: usize,
     pub(super) parsed: usize,
+    pub(super) resource_events: usize,
     pub(super) deferred: usize,
     pub(super) failed: usize,
 }
@@ -390,6 +406,13 @@ pub(super) async fn process_record(
                 state.save().await?;
             }
             Err(error) => {
+                tracing::warn!(
+                    match_id = record.match_id,
+                    attempt,
+                    force_reparse,
+                    error_code = error.code,
+                    "replay download failed",
+                );
                 record_failure(
                     state,
                     job_id,
@@ -410,6 +433,13 @@ pub(super) async fn process_record(
     let parsed = match parse_replay(record.match_id, &raw_path, model_version) {
         Ok(parsed) => parsed,
         Err(error) => {
+            tracing::warn!(
+                match_id = record.match_id,
+                attempt,
+                force_reparse,
+                error_code = error,
+                "replay parse failed",
+            );
             let parse_failures = parse_failures.saturating_add(1);
             let status = parse_failure_status(parse_failures);
             let failed_permanently = status == ReplayStatus::Failed;
@@ -453,6 +483,13 @@ pub(super) async fn process_record(
             &parsed.resources,
         )
         .await?;
+    summary.resource_events += parsed.resources.len();
+    tracing::info!(
+        match_id = record.match_id,
+        position_count = parsed.positions.len(),
+        resource_count = parsed.resources.len(),
+        "replay parsed"
+    );
 
     state.jobs.insert(
         job_id.to_string(),
@@ -589,6 +626,7 @@ mod tests {
 
         assert!(query.contains("FROM my_db.replay_reparse_requests"));
         assert!(query.contains("argMax(status, model_version) AS status"));
+        assert!(query.contains("argMax(error_code, model_version) AS error_code"));
         assert!(query.contains("WHERE status = 'pending'"));
         assert!(query.ends_with("ORDER BY requested_at LIMIT 100"));
     }
