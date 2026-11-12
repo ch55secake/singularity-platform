@@ -132,14 +132,26 @@ pub(super) fn parse_replay(
     path: &Path,
     model_version: u64,
 ) -> Result<ReplayModel, &'static str> {
-    let file = StdFile::open(path).map_err(|_| "parser_input_failed")?;
-    let demo = DemoFile::start_reading(BufReader::new(file)).map_err(|_| "invalid_demo")?;
+    let file = StdFile::open(path).map_err(|error| {
+        tracing::warn!(match_id, error = %error, "failed to open replay demo");
+        "parser_input_failed"
+    })?;
+    let demo = DemoFile::start_reading(BufReader::new(file)).map_err(|error| {
+        tracing::warn!(match_id, error = ?error, "failed to read replay demo header");
+        "invalid_demo"
+    })?;
     let state = Arc::new(Mutex::new(ReplayVisitorState::default()));
     let visitor = ReplayVisitor {
         state: Arc::clone(&state),
     };
-    let mut parser = Parser::from_stream_with_visitor(demo, visitor).map_err(|_| "invalid_demo")?;
-    parser.run_to_end().map_err(|_| "parser_failed")?;
+    let mut parser = Parser::from_stream_with_visitor(demo, visitor).map_err(|error| {
+        tracing::warn!(match_id, error = ?error, "failed to initialize replay parser");
+        "invalid_demo"
+    })?;
+    parser.run_to_end().map_err(|error| {
+        tracing::warn!(match_id, error = ?error, "replay parser failed while reading demo");
+        "parser_failed"
+    })?;
     drop(parser);
     let state = Arc::try_unwrap(state)
         .map_err(|_| "parser_state_failed")?
